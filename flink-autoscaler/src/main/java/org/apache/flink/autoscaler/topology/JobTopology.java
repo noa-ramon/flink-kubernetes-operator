@@ -18,8 +18,10 @@
 package org.apache.flink.autoscaler.topology;
 
 import org.apache.flink.autoscaler.exceptions.NotReadyException;
+import org.apache.flink.runtime.execution.ExecutionState;
 import org.apache.flink.runtime.instance.SlotSharingGroupId;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
+import org.apache.flink.runtime.rest.messages.job.JobDetailsInfo;
 
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.core.JsonProcessingException;
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.JsonNode;
@@ -139,6 +141,53 @@ public class JobTopology {
             sorted.addAll(verticesWithZeroIndegree);
         }
         return sorted;
+    }
+
+    /**
+     * Builds the topology from the job details returned by the REST API, unwrapping the json plan
+     * and collecting the per-vertex parallelism, slot sharing groups, IO metrics and finished
+     * state.
+     *
+     * @param jobDetailsInfo the job details to derive the topology from
+     * @return the job topology
+     * @throws JsonProcessingException if the json plan cannot be parsed
+     */
+    public static JobTopology fromJobDetails(JobDetailsInfo jobDetailsInfo)
+            throws JsonProcessingException {
+        var slotSharingGroupIdMap =
+                jobDetailsInfo.getJobVertexInfos().stream()
+                        .filter(e -> e.getSlotSharingGroupId() != null)
+                        .collect(
+                                Collectors.toMap(
+                                        JobDetailsInfo.JobVertexDetailsInfo::getJobVertexID,
+                                        JobDetailsInfo.JobVertexDetailsInfo
+                                                ::getSlotSharingGroupId));
+        var maxParallelismMap =
+                jobDetailsInfo.getJobVertexInfos().stream()
+                        .collect(
+                                Collectors.toMap(
+                                        JobDetailsInfo.JobVertexDetailsInfo::getJobVertexID,
+                                        JobDetailsInfo.JobVertexDetailsInfo::getMaxParallelism));
+
+        // Flink 1.17 introduced a strange behaviour where the JobDetailsInfo#getJsonPlan()
+        // doesn't return the jsonPlan correctly but it wraps with RawJson{json='plan'}
+        var rawPlan = jobDetailsInfo.getJsonPlan();
+        var json = rawPlan.substring("RawJson{json='".length(), rawPlan.length() - "'}".length());
+
+        var metrics = new HashMap<JobVertexID, IOMetrics>();
+        var finished = new HashSet<JobVertexID>();
+        jobDetailsInfo
+                .getJobVertexInfos()
+                .forEach(
+                        d -> {
+                            if (d.getExecutionState() == ExecutionState.FINISHED) {
+                                finished.add(d.getJobVertexID());
+                            }
+                            metrics.put(
+                                    d.getJobVertexID(), IOMetrics.from(d.getJobVertexMetrics()));
+                        });
+
+        return fromJsonPlan(json, slotSharingGroupIdMap, maxParallelismMap, metrics, finished);
     }
 
     public static JobTopology fromJsonPlan(

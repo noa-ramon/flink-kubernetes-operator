@@ -29,11 +29,9 @@ import org.apache.flink.autoscaler.metrics.MetricNotFoundException;
 import org.apache.flink.autoscaler.metrics.ScalingMetric;
 import org.apache.flink.autoscaler.metrics.ScalingMetrics;
 import org.apache.flink.autoscaler.state.AutoScalerStateStore;
-import org.apache.flink.autoscaler.topology.IOMetrics;
 import org.apache.flink.autoscaler.topology.JobTopology;
 import org.apache.flink.client.program.rest.RestClusterClient;
 import org.apache.flink.configuration.Configuration;
-import org.apache.flink.runtime.execution.ExecutionState;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.rest.messages.EmptyRequestBody;
 import org.apache.flink.runtime.rest.messages.JobIDPathParameter;
@@ -227,41 +225,7 @@ public abstract class ScalingMetricCollector<KEY, Context extends JobAutoScalerC
     @VisibleForTesting
     @SneakyThrows
     protected JobTopology getJobTopology(JobDetailsInfo jobDetailsInfo) {
-        var slotSharingGroupIdMap =
-                jobDetailsInfo.getJobVertexInfos().stream()
-                        .filter(e -> e.getSlotSharingGroupId() != null)
-                        .collect(
-                                Collectors.toMap(
-                                        JobDetailsInfo.JobVertexDetailsInfo::getJobVertexID,
-                                        JobDetailsInfo.JobVertexDetailsInfo
-                                                ::getSlotSharingGroupId));
-        var maxParallelismMap =
-                jobDetailsInfo.getJobVertexInfos().stream()
-                        .collect(
-                                Collectors.toMap(
-                                        JobDetailsInfo.JobVertexDetailsInfo::getJobVertexID,
-                                        JobDetailsInfo.JobVertexDetailsInfo::getMaxParallelism));
-
-        // Flink 1.17 introduced a strange behaviour where the JobDetailsInfo#getJsonPlan()
-        // doesn't return the jsonPlan correctly but it wraps with RawJson{json='plan'}
-        var rawPlan = jobDetailsInfo.getJsonPlan();
-        var json = rawPlan.substring("RawJson{json='".length(), rawPlan.length() - "'}".length());
-
-        var metrics = new HashMap<JobVertexID, IOMetrics>();
-        var finished = new HashSet<JobVertexID>();
-        jobDetailsInfo
-                .getJobVertexInfos()
-                .forEach(
-                        d -> {
-                            if (d.getExecutionState() == ExecutionState.FINISHED) {
-                                finished.add(d.getJobVertexID());
-                            }
-                            metrics.put(
-                                    d.getJobVertexID(), IOMetrics.from(d.getJobVertexMetrics()));
-                        });
-
-        return JobTopology.fromJsonPlan(
-                json, slotSharingGroupIdMap, maxParallelismMap, metrics, finished);
+        return JobTopology.fromJobDetails(jobDetailsInfo);
     }
 
     private void updateKafkaPulsarSourceNumPartitions(
