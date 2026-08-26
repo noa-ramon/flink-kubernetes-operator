@@ -95,9 +95,12 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.Queue;
 import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -753,6 +756,43 @@ public class TestingFlinkService extends AbstractFlinkService {
     public Map<String, String> getMetrics(
             Configuration conf, String jobId, List<String> metricNames) {
         return metricsValues;
+    }
+
+    /**
+     * Pending records reported per {@code getSourcePendingRecords} call, consumed in order; a null
+     * entry means no source reported the metric.
+     */
+    @Setter private Queue<Optional<Long>> pendingRecordsQueue = new LinkedList<>();
+
+    @Setter private boolean pendingRecordsThrows = false;
+
+    @Override
+    public OptionalLong getSourcePendingRecords(Configuration conf, String jobId) throws Exception {
+        if (pendingRecordsThrows) {
+            throw new Exception("Testing pending records failure");
+        }
+        // The last scripted value is sticky, so a single value means "always this backlog"
+        var next =
+                pendingRecordsQueue.size() > 1
+                        ? pendingRecordsQueue.poll()
+                        : pendingRecordsQueue.peek();
+        if (next == null) {
+            return OptionalLong.of(0L);
+        }
+        return next.map(OptionalLong::of).orElseGet(OptionalLong::empty);
+    }
+
+    /** Scripts "no source reports the metric" for the next check(s). */
+    public void setPendingRecordsUnreported() {
+        pendingRecordsQueue = new LinkedList<>(List.of(Optional.empty()));
+    }
+
+    public void setPendingRecords(Long... values) {
+        var q = new LinkedList<Optional<Long>>();
+        for (var v : values) {
+            q.add(Optional.of(v));
+        }
+        pendingRecordsQueue = q;
     }
 
     /**

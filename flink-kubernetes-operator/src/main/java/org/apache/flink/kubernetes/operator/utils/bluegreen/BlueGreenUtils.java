@@ -48,6 +48,8 @@ import java.util.Map;
 import java.util.Optional;
 
 import static org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentConfigOptions.ABORT_GRACE_PERIOD;
+import static org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentConfigOptions.CUTOVER_DRAIN_TIMEOUT;
+import static org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentConfigOptions.CUTOVER_WAIT_FOR_SOURCE_DRAIN;
 import static org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentConfigOptions.DEPLOYMENT_DELETION_DELAY;
 import static org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentConfigOptions.RECONCILIATION_RESCHEDULING_INTERVAL;
 import static org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGreenKubernetesService.getDependentObjectMeta;
@@ -170,6 +172,28 @@ public class BlueGreenUtils {
         return Math.max(
                 getConfigOption(context.getBgDeployment(), DEPLOYMENT_DELETION_DELAY).toMillis(),
                 0);
+    }
+
+    /**
+     * Whether the previous deployment must wait for the new deployment to drain its source backlog
+     * before being deleted.
+     *
+     * @param context the Blue/Green transition context
+     * @return true if the cutover should wait for the source backlog to drain
+     */
+    public static boolean isWaitForSourceDrainEnabled(BlueGreenContext context) {
+        return getConfigOption(context.getBgDeployment(), CUTOVER_WAIT_FOR_SOURCE_DRAIN);
+    }
+
+    /**
+     * Gets the max time to wait for the new deployment to drain its source backlog.
+     *
+     * @param context the Blue/Green transition context
+     * @return drain timeout in milliseconds
+     */
+    public static long getCutoverDrainTimeout(BlueGreenContext context) {
+        return Math.max(
+                getConfigOption(context.getBgDeployment(), CUTOVER_DRAIN_TIMEOUT).toMillis(), 0);
     }
 
     /**

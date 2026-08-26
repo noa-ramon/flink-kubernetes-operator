@@ -70,4 +70,27 @@ public class FlinkBlueGreenDeploymentConfigOptions {
                     .defaultValue(Duration.ofMillis(0))
                     .withDescription(
                             "Configurable delay before deleting a deployment after being marked done.");
+    public static final ConfigOption<Boolean> CUTOVER_WAIT_FOR_SOURCE_DRAIN =
+            operatorConfig("cutover.wait-for-source-drain")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "If enabled, the previous deployment is kept running until the new deployment has"
+                                    + " drained its source backlog (no pending records), instead of being deleted as"
+                                    + " soon as the new deployment is ready. A deployment restored from a savepoint is"
+                                    + " ready while it still replays the records produced during its own startup; for"
+                                    + " event time pipelines with a bounded allowed lateness, deleting the previous"
+                                    + " deployment during that catch-up leaves those records without a producer."
+                                    + " Requires sources exposing the pendingRecords metric (e.g. KafkaSource);"
+                                    + " sources not reporting it are treated as having no pending records.");
+
+    public static final ConfigOption<Duration> CUTOVER_DRAIN_TIMEOUT =
+            operatorConfig("cutover.drain-timeout")
+                    .durationType()
+                    .defaultValue(Duration.ofHours(1))
+                    .withDescription(
+                            "The max time to wait for the new deployment to drain its source backlog when"
+                                    + " cutover.wait-for-source-drain is enabled, measured from the moment the new"
+                                    + " deployment became ready. If exceeded, the transition is aborted: the new"
+                                    + " deployment is suspended and the previous one remains active.");
 }

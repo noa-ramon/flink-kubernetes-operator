@@ -62,15 +62,20 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import static org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentConfigOptions.ABORT_GRACE_PERIOD;
+import static org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentConfigOptions.CUTOVER_DRAIN_TIMEOUT;
+import static org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentConfigOptions.CUTOVER_WAIT_FOR_SOURCE_DRAIN;
 import static org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentConfigOptions.DEPLOYMENT_DELETION_DELAY;
 import static org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentConfigOptions.RECONCILIATION_RESCHEDULING_INTERVAL;
 import static org.apache.flink.kubernetes.operator.api.utils.BaseTestUtils.SAMPLE_JAR;
 import static org.apache.flink.kubernetes.operator.api.utils.BaseTestUtils.TEST_DEPLOYMENT_NAME;
 import static org.apache.flink.kubernetes.operator.api.utils.BaseTestUtils.TEST_NAMESPACE;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.instantStrToMillis;
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -1680,5 +1685,311 @@ public class FlinkBlueGreenDeploymentControllerTest {
 
         // 4. Verify ingress created and points to Green after transition completes
         assertIngressPointsToService(GREEN_CLUSTER_ID + REST_SVC_NAME_SUFFIX);
+    }
+
+    // ==================== Cutover source-drain gate ====================
+
+    /**
+     * With the drain gate enabled, the previous deployment must be kept alive while the new
+     * deployment still reports pending records, and deleted once the backlog is drained.
+     */
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyCutoverWaitsForSourceDrain(FlinkVersion flinkVersion) throws Exception {
+        var blueGreenDeployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        flinkVersion,
+                        null,
+                        UpgradeMode.SAVEPOINT);
+
+        Map<String, String> configuration = blueGreenDeployment.getSpec().getConfiguration();
+        configuration.put(CUTOVER_WAIT_FOR_SOURCE_DRAIN.key(), "true");
+        configuration.put(CUTOVER_DRAIN_TIMEOUT.key(), "60000");
+        configuration.put(DEPLOYMENT_DELETION_DELAY.key(), "0");
+        configuration.put(RECONCILIATION_RESCHEDULING_INTERVAL.key(), "100");
+        configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
+
+        var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+
+        // Green reports a backlog first, then drains on the following check
+        flinkService.setPendingRecords(500L, 0L, 0L, 0L);
+
+        simulateChangeInSpec(rs.deployment, UUID.randomUUID().toString(), 0, null);
+        rs = handleSavepoint(rs);
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN,
+                rs.reconciledStatus.getBlueGreenState());
+
+        simulateSuccessfulJobStart(getFlinkDeployments().get(1));
+        // Marks Green ready and arms the (zero) deletion delay
+        rs = reconcile(rs.deployment);
+        // Drain check #1: 500 pending -> Blue must be kept
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                2,
+                getFlinkDeployments().size(),
+                "the previous deployment must be kept while the new one has pending records");
+        assertEquals(
+                FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN,
+                rs.reconciledStatus.getBlueGreenState(),
+                "the transition must not finalize before the backlog is drained");
+
+        // Drain check #2: 0 pending, and past the settle window -> cutover proceeds
+        Thread.sleep(300);
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                1,
+                getFlinkDeployments().size(),
+                "the previous deployment must be deleted once the backlog is drained");
+        // On this release line the delete call does not finalize; the next reconcile does
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_GREEN,
+                rs.reconciledStatus.getBlueGreenState());
+    }
+
+    /**
+     * With the drain gate enabled, a backlog that does not drain within the drain timeout must
+     * abort the transition: the new deployment is suspended and the previous one stays active.
+     */
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyCutoverAbortsWhenSourceDrainTimesOut(FlinkVersion flinkVersion)
+            throws Exception {
+        var blueGreenDeployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        flinkVersion,
+                        null,
+                        UpgradeMode.SAVEPOINT);
+
+        Map<String, String> configuration = blueGreenDeployment.getSpec().getConfiguration();
+        configuration.put(CUTOVER_WAIT_FOR_SOURCE_DRAIN.key(), "true");
+        configuration.put(CUTOVER_DRAIN_TIMEOUT.key(), "500");
+        configuration.put(DEPLOYMENT_DELETION_DELAY.key(), "0");
+        configuration.put(RECONCILIATION_RESCHEDULING_INTERVAL.key(), "100");
+        configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
+
+        var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+
+        // Green never drains
+        flinkService.setPendingRecords(1_000L);
+
+        simulateChangeInSpec(rs.deployment, UUID.randomUUID().toString(), 0, null);
+        rs = handleSavepoint(rs);
+        rs = reconcile(rs.deployment);
+        simulateSuccessfulJobStart(getFlinkDeployments().get(1));
+        rs = reconcile(rs.deployment);
+
+        var abortRef = new AtomicReference<>(rs);
+        await().atMost(10, TimeUnit.SECONDS)
+                .pollInterval(100, TimeUnit.MILLISECONDS)
+                .untilAsserted(
+                        () -> {
+                            abortRef.set(reconcile(abortRef.get().deployment));
+                            assertEquals(
+                                    FlinkBlueGreenDeploymentState.ACTIVE_BLUE,
+                                    abortRef.get().reconciledStatus.getBlueGreenState());
+                        });
+        rs = abortRef.get();
+
+        assertFailingJobStatus(rs);
+        assertEquals(
+                2, getFlinkDeployments().size(), "the failed deployment is kept for inspection");
+        assertEquals(
+                JobState.RUNNING,
+                getFlinkDeployments().get(0).getSpec().getJob().getState(),
+                "the previous deployment must keep running after a drain-timeout abort");
+        assertEquals(
+                JobState.SUSPENDED,
+                getFlinkDeployments().get(1).getSpec().getJob().getState(),
+                "the new deployment must be suspended on a drain-timeout abort");
+    }
+
+    /** With the drain gate disabled (default), pending records must not delay the cutover. */
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyCutoverIgnoresSourceDrainWhenDisabled(FlinkVersion flinkVersion)
+            throws Exception {
+        var blueGreenDeployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        flinkVersion,
+                        null,
+                        UpgradeMode.SAVEPOINT);
+
+        Map<String, String> configuration = blueGreenDeployment.getSpec().getConfiguration();
+        configuration.put(DEPLOYMENT_DELETION_DELAY.key(), "0");
+        configuration.put(RECONCILIATION_RESCHEDULING_INTERVAL.key(), "100");
+        configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
+
+        var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+
+        // A large backlog that would block the gate if it were enabled
+        flinkService.setPendingRecords(1_000_000L);
+
+        simulateChangeInSpec(rs.deployment, UUID.randomUUID().toString(), 0, null);
+        rs = handleSavepoint(rs);
+        rs = reconcile(rs.deployment);
+        simulateSuccessfulJobStart(getFlinkDeployments().get(1));
+        rs = reconcile(rs.deployment);
+        rs = reconcile(rs.deployment);
+
+        assertEquals(
+                1,
+                getFlinkDeployments().size(),
+                "with the gate disabled the previous deployment is deleted regardless of backlog");
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_GREEN,
+                rs.reconciledStatus.getBlueGreenState());
+    }
+
+    /**
+     * Regression test for a premature cutover observed on a real cluster: task metrics reach the
+     * JobManager on the heartbeat interval, so a freshly started job reports no pendingRecords for
+     * a while even though its sources are already consuming. That silence must not be read as an
+     * empty backlog, otherwise the previous deployment is deleted while the new one is still
+     * catching up.
+     */
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyUnreportedPendingRecordsHoldsUntilIdleIsConfirmed(FlinkVersion flinkVersion)
+            throws Exception {
+        var blueGreenDeployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        flinkVersion,
+                        null,
+                        UpgradeMode.SAVEPOINT);
+
+        Map<String, String> configuration = blueGreenDeployment.getSpec().getConfiguration();
+        configuration.put(CUTOVER_WAIT_FOR_SOURCE_DRAIN.key(), "true");
+        configuration.put(CUTOVER_DRAIN_TIMEOUT.key(), "60000");
+        configuration.put(DEPLOYMENT_DELETION_DELAY.key(), "0");
+        // a long reschedule interval keeps the checks inside the settle window
+        configuration.put(RECONCILIATION_RESCHEDULING_INTERVAL.key(), "5000");
+        configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
+
+        var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+
+        // No source reports the metric at all - the state the real cluster was in right after the
+        // child became ready
+        flinkService.setPendingRecordsUnreported();
+
+        simulateChangeInSpec(rs.deployment, UUID.randomUUID().toString(), 0, null);
+        rs = handleSavepoint(rs);
+        rs = reconcile(rs.deployment);
+        simulateSuccessfulJobStart(getFlinkDeployments().get(1));
+        rs = reconcile(rs.deployment);
+        rs = reconcile(rs.deployment);
+        rs = reconcile(rs.deployment);
+
+        assertEquals(
+                2,
+                getFlinkDeployments().size(),
+                "an unreported metric must not be read as idle inside the settle window");
+        assertEquals(
+                FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN,
+                rs.reconciledStatus.getBlueGreenState(),
+                "the transition must not finalize while the backlog is unknown");
+    }
+
+    /**
+     * A source reading an idle topic never exposes pendingRecords at all, so silence that persists
+     * past the settle window must be read as an empty backlog - otherwise a job with any
+     * permanently idle source could never cut over and every transition would end in an abort.
+     */
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyUnreportedPendingRecordsCutsOverOnceIdleIsConfirmed(FlinkVersion flinkVersion)
+            throws Exception {
+        var blueGreenDeployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        flinkVersion,
+                        null,
+                        UpgradeMode.SAVEPOINT);
+
+        Map<String, String> configuration = blueGreenDeployment.getSpec().getConfiguration();
+        configuration.put(CUTOVER_WAIT_FOR_SOURCE_DRAIN.key(), "true");
+        configuration.put(CUTOVER_DRAIN_TIMEOUT.key(), "60000");
+        configuration.put(DEPLOYMENT_DELETION_DELAY.key(), "0");
+        configuration.put(RECONCILIATION_RESCHEDULING_INTERVAL.key(), "100");
+        configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
+
+        var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+
+        flinkService.setPendingRecordsUnreported();
+
+        simulateChangeInSpec(rs.deployment, UUID.randomUUID().toString(), 0, null);
+        rs = handleSavepoint(rs);
+        rs = reconcile(rs.deployment);
+        simulateSuccessfulJobStart(getFlinkDeployments().get(1));
+        // marks the new deployment ready, then holds while still inside the settle window
+        rs = reconcile(rs.deployment);
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                2,
+                getFlinkDeployments().size(),
+                "the previous deployment must be kept until the silence is confirmed");
+
+        // past the settle window the continued silence is read as an idle source
+        Thread.sleep(300);
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                1,
+                getFlinkDeployments().size(),
+                "a source that never exposes the metric must not block the cutover forever");
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_GREEN,
+                rs.reconciledStatus.getBlueGreenState());
+    }
+
+    /** A zero read on the very first check after readiness must not be enough to cut over. */
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyFirstZeroReadingIsNotEnoughToCutOver(FlinkVersion flinkVersion)
+            throws Exception {
+        var blueGreenDeployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        flinkVersion,
+                        null,
+                        UpgradeMode.SAVEPOINT);
+
+        Map<String, String> configuration = blueGreenDeployment.getSpec().getConfiguration();
+        configuration.put(CUTOVER_WAIT_FOR_SOURCE_DRAIN.key(), "true");
+        configuration.put(CUTOVER_DRAIN_TIMEOUT.key(), "60000");
+        configuration.put(DEPLOYMENT_DELETION_DELAY.key(), "0");
+        // a long reschedule interval makes the settle window observable in the test
+        configuration.put(RECONCILIATION_RESCHEDULING_INTERVAL.key(), "5000");
+        configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
+
+        var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+
+        flinkService.setPendingRecords(0L);
+
+        simulateChangeInSpec(rs.deployment, UUID.randomUUID().toString(), 0, null);
+        rs = handleSavepoint(rs);
+        rs = reconcile(rs.deployment);
+        simulateSuccessfulJobStart(getFlinkDeployments().get(1));
+        // marks ready, then the first drain check lands inside the settle window
+        rs = reconcile(rs.deployment);
+        rs = reconcile(rs.deployment);
+
+        assertEquals(
+                2,
+                getFlinkDeployments().size(),
+                "a zero read inside the settle window must not trigger the cutover");
     }
 }

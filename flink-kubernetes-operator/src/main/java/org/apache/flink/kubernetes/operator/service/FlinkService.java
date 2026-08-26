@@ -47,6 +47,7 @@ import javax.annotation.Nullable;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
 
 /** Service for submitting and interacting with Flink clusters and jobs. */
 public interface FlinkService {
@@ -123,6 +124,25 @@ public interface FlinkService {
 
     boolean scale(FlinkResourceContext<?> resourceContext, Configuration deployConfig)
             throws Exception;
+
+    /**
+     * Sums the {@code pendingRecords} metric over the job's running sources, i.e. the backlog the
+     * job still has to consume.
+     *
+     * <p>A source that does not expose the metric contributes nothing, matching how the autoscaler
+     * reads it: sources initialise it lazily on their first record, so an idle source never exposes
+     * it and has no backlog by definition. Finished sources are skipped for the same reason.
+     *
+     * <p>Returns an empty result only when no source reports the metric at all, which means the job
+     * could not be read rather than that it is drained. Callers using the value as a drain
+     * condition must treat empty as "unknown", never as "drained".
+     *
+     * @param conf the configuration to use for the REST client
+     * @param jobId the job to query
+     * @return total pending records across the job's sources, or empty if none reported it
+     * @throws Exception in case of REST failures
+     */
+    OptionalLong getSourcePendingRecords(Configuration conf, String jobId) throws Exception;
 
     Map<String, String> getMetrics(Configuration conf, String jobId, List<String> metricNames)
             throws Exception;

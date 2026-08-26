@@ -22,6 +22,8 @@ import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.autoscaler.config.AutoScalerOptions;
+import org.apache.flink.autoscaler.metrics.FlinkMetric;
+import org.apache.flink.autoscaler.topology.JobTopology;
 import org.apache.flink.autoscaler.utils.JobStatusUtils;
 import org.apache.flink.client.program.rest.RestClusterClient;
 import org.apache.flink.configuration.CheckpointingOptions;
@@ -57,6 +59,7 @@ import org.apache.flink.kubernetes.operator.utils.ExceptionUtils;
 import org.apache.flink.kubernetes.operator.utils.FlinkUtils;
 import org.apache.flink.runtime.client.JobStatusMessage;
 import org.apache.flink.runtime.highavailability.nonha.standalone.StandaloneClientHAServices;
+import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.jobmaster.JobResult;
 import org.apache.flink.runtime.messages.FlinkJobNotFoundException;
 import org.apache.flink.runtime.messages.FlinkJobTerminatedWithoutCancellationException;
@@ -68,6 +71,9 @@ import org.apache.flink.runtime.rest.messages.EmptyMessageParameters;
 import org.apache.flink.runtime.rest.messages.EmptyRequestBody;
 import org.apache.flink.runtime.rest.messages.JobExceptionsHeaders;
 import org.apache.flink.runtime.rest.messages.JobExceptionsInfoWithHistory;
+import org.apache.flink.runtime.rest.messages.JobIDPathParameter;
+import org.apache.flink.runtime.rest.messages.JobMessageParameters;
+import org.apache.flink.runtime.rest.messages.JobVertexIdPathParameter;
 import org.apache.flink.runtime.rest.messages.JobsOverviewHeaders;
 import org.apache.flink.runtime.rest.messages.TriggerId;
 import org.apache.flink.runtime.rest.messages.checkpoints.CheckpointIdPathParameter;
@@ -80,7 +86,12 @@ import org.apache.flink.runtime.rest.messages.checkpoints.CheckpointTriggerHeade
 import org.apache.flink.runtime.rest.messages.checkpoints.CheckpointTriggerRequestBody;
 import org.apache.flink.runtime.rest.messages.checkpoints.CheckpointingStatistics;
 import org.apache.flink.runtime.rest.messages.checkpoints.CheckpointingStatisticsHeaders;
+import org.apache.flink.runtime.rest.messages.job.JobDetailsHeaders;
 import org.apache.flink.runtime.rest.messages.job.JobExceptionsMessageParameters;
+import org.apache.flink.runtime.rest.messages.job.metrics.AggregatedMetric;
+import org.apache.flink.runtime.rest.messages.job.metrics.AggregatedMetricsResponseBody;
+import org.apache.flink.runtime.rest.messages.job.metrics.AggregatedSubtaskMetricsHeaders;
+import org.apache.flink.runtime.rest.messages.job.metrics.AggregatedSubtaskMetricsParameters;
 import org.apache.flink.runtime.rest.messages.job.metrics.JobMetricsHeaders;
 import org.apache.flink.runtime.rest.messages.job.savepoints.SavepointDisposalRequest;
 import org.apache.flink.runtime.rest.messages.job.savepoints.SavepointDisposalTriggerHeaders;
@@ -145,6 +156,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -1080,6 +1092,104 @@ public abstract class AbstractFlinkService implements FlinkService {
         } catch (Exception e) {
             throw new RuntimeException("Failed to create empty jar", e);
         }
+    }
+
+    @Override
+    public OptionalLong getSourcePendingRecords(Configuration conf, String jobId) throws Exception {
+        var flinkJobId = JobID.fromHexString(jobId);
+        try (var clusterClient = getClusterClient(conf)) {
+            var detailsParameters = new JobMessageParameters();
+            detailsParameters.jobPathParameter.resolve(flinkJobId);
+            var jobDetails =
+                    clusterClient
+                            .sendRequest(
+                                    JobDetailsHeaders.getInstance(),
+                                    detailsParameters,
+                                    EmptyRequestBody.getInstance())
+                            .get(
+                                    operatorConfig.getFlinkClientTimeout().toSeconds(),
+                                    TimeUnit.SECONDS);
+
+            var topology = JobTopology.fromJobDetails(jobDetails);
+
+            long pendingRecords = 0;
+            int sourcesReporting = 0;
+
+            for (var vertexId : topology.getVertexInfos().keySet()) {
+                // Only sources carry a backlog, and a bounded source that already finished cannot
+                // hold one - the autoscaler reads finished vertices as zero for the same reason.
+                if (!topology.isSource(vertexId)
+                        || topology.getFinishedVertices().contains(vertexId)) {
+                    continue;
+                }
+                // The metric is exposed per operator, so its name carries the operator as a prefix
+                // (for example "Source__MySource.pendingRecords"). Ask the vertex which metrics it
+                // has before querying, exactly as the autoscaler does - a filter on the bare name
+                // matches nothing and would look identical to a drained backlog.
+                var names =
+                        FlinkMetric.PENDING_RECORDS.findAll(
+                                queryVertexMetrics(clusterClient, flinkJobId, vertexId, null)
+                                        .getMetrics()
+                                        .stream()
+                                        .map(AggregatedMetric::getId)
+                                        .collect(Collectors.toList()));
+
+                // A source that does not expose the metric contributes no backlog, matching how
+                // the autoscaler reads it: sources initialise it lazily on their first record, so
+                // an idle source never exposes it at all and has nothing pending by definition.
+                if (names.isEmpty()) {
+                    LOG.debug("Source {} does not expose {}", vertexId, "pendingRecords");
+                    continue;
+                }
+
+                for (var metric :
+                        queryVertexMetrics(clusterClient, flinkJobId, vertexId, names)
+                                .getMetrics()) {
+                    if (metric.getSum() != null) {
+                        pendingRecords += metric.getSum().longValue();
+                        sourcesReporting++;
+                        LOG.debug(
+                                "Source {} reports {}={}",
+                                vertexId,
+                                metric.getId(),
+                                metric.getSum().longValue());
+                    }
+                }
+            }
+
+            // No source reporting at all is not a drained job, it is a job we failed to read. That
+            // is what a query for the un-prefixed metric name used to look like, and it let a
+            // cutover through while the backlog was still growing.
+            if (sourcesReporting == 0) {
+                return OptionalLong.empty();
+            }
+            return OptionalLong.of(pendingRecords);
+        }
+    }
+
+    private AggregatedMetricsResponseBody queryVertexMetrics(
+            RestClusterClient<String> clusterClient,
+            JobID jobId,
+            JobVertexID vertexId,
+            @Nullable List<String> metricNames)
+            throws Exception {
+        var parameters = new AggregatedSubtaskMetricsParameters();
+        var pathIt = parameters.getPathParameters().iterator();
+        ((JobIDPathParameter) pathIt.next()).resolve(jobId);
+        ((JobVertexIdPathParameter) pathIt.next()).resolve(vertexId);
+        if (metricNames != null) {
+            parameters
+                    .getQueryParameters()
+                    .iterator()
+                    .next()
+                    .resolveFromString(String.join(",", metricNames));
+        }
+        return clusterClient
+                .sendRequest(
+                        AggregatedSubtaskMetricsHeaders.getInstance(),
+                        parameters,
+                        EmptyRequestBody.getInstance())
+                .get(operatorConfig.getFlinkClientTimeout().toSeconds(), TimeUnit.SECONDS);
     }
 
     @Override

@@ -30,6 +30,8 @@ import org.apache.flink.kubernetes.operator.api.status.SnapshotTriggerType;
 import org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions;
 import org.apache.flink.kubernetes.operator.controller.FlinkBlueGreenDeployments;
 import org.apache.flink.kubernetes.operator.controller.FlinkResourceContext;
+import org.apache.flink.kubernetes.operator.utils.EventRecorder;
+import org.apache.flink.kubernetes.operator.utils.EventUtils;
 import org.apache.flink.kubernetes.operator.utils.IngressUtils;
 import org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils;
 import org.apache.flink.util.Preconditions;
@@ -43,19 +45,23 @@ import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Objects;
+import java.util.OptionalLong;
 
 import static org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGreenKubernetesService.deleteFlinkDeployment;
 import static org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGreenKubernetesService.deployCluster;
 import static org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGreenKubernetesService.isFlinkDeploymentReady;
 import static org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGreenKubernetesService.suspendFlinkDeployment;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.fetchSavepointInfo;
+import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.getCutoverDrainTimeout;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.getReconciliationReschedInterval;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.getSpecDiff;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.hasSpecChanged;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.instantStrToMillis;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.isSavepointRequired;
+import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.isWaitForSourceDrainEnabled;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.millisToInstantStr;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.prepareFlinkDeployment;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.setLastReconciledSpec;
@@ -66,6 +72,7 @@ public class BlueGreenDeploymentService {
 
     private static final Logger LOG = LoggerFactory.getLogger(BlueGreenDeploymentService.class);
     private static final long RETRY_DELAY_MS = 500;
+    private static final Duration CUTOVER_EVENT_INTERVAL = Duration.ofMinutes(1);
 
     // ==================== Deployment Initiation Methods ====================
 
@@ -608,10 +615,183 @@ public class BlueGreenDeploymentService {
         long deletionTimestamp = deploymentReadyTimestamp + deploymentDeletionDelayMs;
 
         if (deletionTimestamp < System.currentTimeMillis()) {
+            if (isWaitForSourceDrainEnabled(context)) {
+                return handleSourceDrain(
+                        context,
+                        currentDeployment,
+                        nextDeployment,
+                        nextState,
+                        deploymentReadyTimestamp);
+            }
             return deleteDeployment(currentDeployment, context);
         } else {
             return waitBeforeDeleting(currentDeployment, deletionTimestamp);
         }
+    }
+
+    /**
+     * Keeps the previous deployment alive until the new deployment has drained its source backlog.
+     *
+     * <p>A deployment restored from the transition savepoint is ready while it still replays the
+     * records produced during its own startup. For event time pipelines with a bounded allowed
+     * lateness, deleting the previous deployment during that catch-up leaves those records without
+     * a producer, so the drain is a correctness condition rather than a freshness one.
+     *
+     * <p>If the backlog is not drained within the configured timeout the transition is aborted: the
+     * new deployment is suspended and the previous one stays active, consistent with how a
+     * deployment that never becomes ready is handled.
+     */
+    private UpdateControl<FlinkBlueGreenDeployment> handleSourceDrain(
+            BlueGreenContext context,
+            FlinkDeployment currentDeployment,
+            FlinkDeployment nextDeployment,
+            FlinkBlueGreenDeploymentState nextState,
+            long deploymentReadyTimestamp) {
+
+        String nextDeploymentName = nextDeployment.getMetadata().getName();
+        long reschedInterval = getReconciliationReschedInterval(context);
+        String notDrainedReason = null;
+        OptionalLong pendingRecords = OptionalLong.empty();
+
+        try {
+            pendingRecords = getSourcePendingRecords(context, nextDeployment);
+        } catch (Exception e) {
+            // Treat an unreachable job as not drained: the previous deployment keeps producing
+            // until the metric can be read again or the drain timeout aborts the transition.
+            LOG.warn(
+                    "Could not read pending records for FlinkDeployment '{}', will retry.",
+                    nextDeploymentName,
+                    e);
+            notDrainedReason = "the pending records metric could not be read";
+        }
+
+        // Require the backlog to be read on a settled observation rather than on the first sample
+        // after the deployment became ready: task metrics reach the JobManager on the heartbeat
+        // interval, so a freshly started job is briefly silent even while its sources consume.
+        boolean settled =
+                System.currentTimeMillis() - deploymentReadyTimestamp >= 2 * reschedInterval;
+        boolean readAsIdle = false;
+
+        if (notDrainedReason == null && pendingRecords.isEmpty()) {
+            if (settled) {
+                // Sources initialise the metric lazily on their first record, so a source reading
+                // an idle topic never exposes it at all. Once the deployment has been ready long
+                // enough for a source holding a backlog to have reported one, continued silence
+                // means there is nothing pending - the reading Flink itself applies to a missing
+                // pendingRecords metric.
+                readAsIdle = true;
+            } else {
+                notDrainedReason = "no source reports the pending records metric yet";
+            }
+        }
+
+        if (notDrainedReason == null
+                && pendingRecords.isPresent()
+                && pendingRecords.getAsLong() > 0) {
+            notDrainedReason =
+                    String.format("it has %d pending records", pendingRecords.getAsLong());
+        }
+
+        if (notDrainedReason == null && !settled) {
+            notDrainedReason =
+                    String.format(
+                            "the empty backlog (%d pending) has not been observed for long enough",
+                            pendingRecords.orElse(0L));
+        }
+
+        long heldFor = System.currentTimeMillis() - deploymentReadyTimestamp;
+        long drainDeadline = deploymentReadyTimestamp + getCutoverDrainTimeout(context);
+        boolean pastDeadline = drainDeadline < System.currentTimeMillis();
+
+        // One audit record per evaluation, so the drain can be reconstructed from the operator log
+        // alone: a gate that decides when the previous deployment stops producing has to leave
+        // evidence of every observation it acted on, not only of the decisions that changed state.
+        LOG.info(
+                "Cutover gate for '{}': pendingRecords={}, settled={}, heldFor={} s,"
+                        + " drainTimeoutIn={} s, verdict={}{}",
+                nextDeploymentName,
+                pendingRecords.isPresent()
+                        ? String.valueOf(pendingRecords.getAsLong())
+                        : (readAsIdle ? "unreported (read as idle)" : "unknown"),
+                settled,
+                heldFor / 1000,
+                Math.max(0, drainDeadline - System.currentTimeMillis()) / 1000,
+                notDrainedReason == null ? "CUTOVER" : (pastDeadline ? "ABORT" : "HOLD"),
+                notDrainedReason == null ? "" : " (" + notDrainedReason + ")");
+
+        if (notDrainedReason == null) {
+            String drained =
+                    String.format(
+                            "FlinkDeployment '%s' drained its source backlog (%s, held for %d s),"
+                                    + " proceeding with the cutover.",
+                            nextDeploymentName,
+                            readAsIdle
+                                    ? "no source exposes the pending records metric, read as idle"
+                                    : pendingRecords.getAsLong()
+                                            + " pending reported by its sources",
+                            heldFor / 1000);
+            emitCutoverEvent(context, EventRecorder.Type.Normal, "CutoverDrained", drained);
+            return deleteDeployment(currentDeployment, context);
+        }
+
+        if (pastDeadline) {
+            String aborted =
+                    String.format(
+                            "FlinkDeployment '%s' did not drain its source backlog within the drain"
+                                    + " timeout (%s), aborting the transition and keeping '%s'.",
+                            nextDeploymentName,
+                            notDrainedReason,
+                            currentDeployment.getMetadata().getName());
+            LOG.error(aborted);
+            emitCutoverEvent(context, EventRecorder.Type.Warning, "CutoverAborted", aborted);
+            return abortDeployment(context, nextDeployment, nextState, nextDeploymentName);
+        }
+
+        String held =
+                String.format(
+                        "Not cutting over to FlinkDeployment '%s' yet because %s; keeping '%s'"
+                                + " (held for %d s).",
+                        nextDeploymentName,
+                        notDrainedReason,
+                        currentDeployment.getMetadata().getName(),
+                        (System.currentTimeMillis() - deploymentReadyTimestamp) / 1000);
+        emitCutoverEvent(context, EventRecorder.Type.Normal, "CutoverHeld", held);
+
+        return UpdateControl.<FlinkBlueGreenDeployment>noUpdate().rescheduleAfter(reschedInterval);
+    }
+
+    /**
+     * Surfaces a cutover decision as a Kubernetes event on the Blue/Green resource, so that a hold,
+     * a drain or an abort is visible through {@code kubectl describe} and any event-based tooling
+     * rather than only in the operator log. Repeats of the same message are collapsed over a short
+     * interval.
+     */
+    private void emitCutoverEvent(
+            BlueGreenContext context, EventRecorder.Type type, String reason, String message) {
+        try {
+            EventUtils.createOrUpdateEventWithInterval(
+                    context.getJosdkContext().getClient(),
+                    context.getBgDeployment(),
+                    type,
+                    reason,
+                    message,
+                    EventRecorder.Component.Operator,
+                    event -> {},
+                    reason,
+                    CUTOVER_EVENT_INTERVAL);
+        } catch (Exception e) {
+            // Visibility must never break the reconciliation it is reporting on
+            LOG.warn("Could not emit cutover event for '{}'", context.getDeploymentName(), e);
+        }
+    }
+
+    private OptionalLong getSourcePendingRecords(
+            BlueGreenContext context, FlinkDeployment deployment) throws Exception {
+        FlinkResourceContext<FlinkDeployment> ctx =
+                context.getCtxFactory().getResourceContext(deployment, context.getJosdkContext());
+        return ctx.getFlinkService()
+                .getSourcePendingRecords(
+                        ctx.getObserveConfig(), deployment.getStatus().getJobStatus().getJobId());
     }
 
     private UpdateControl<FlinkBlueGreenDeployment> waitBeforeDeleting(

@@ -53,13 +53,17 @@ import org.apache.flink.kubernetes.operator.reconciler.ReconciliationUtils;
 import org.apache.flink.runtime.checkpoint.CheckpointStatsStatus;
 import org.apache.flink.runtime.clusterframework.types.ResourceID;
 import org.apache.flink.runtime.clusterframework.types.ResourceProfile;
+import org.apache.flink.runtime.execution.ExecutionState;
 import org.apache.flink.runtime.instance.HardwareDescription;
+import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.messages.Acknowledge;
 import org.apache.flink.runtime.rest.RestClient;
 import org.apache.flink.runtime.rest.handler.async.AsynchronousOperationResult;
 import org.apache.flink.runtime.rest.handler.async.TriggerResponse;
 import org.apache.flink.runtime.rest.messages.DashboardConfiguration;
 import org.apache.flink.runtime.rest.messages.JobExceptionsInfoWithHistory;
+import org.apache.flink.runtime.rest.messages.JobPlanInfo;
+import org.apache.flink.runtime.rest.messages.JobVertexIdPathParameter;
 import org.apache.flink.runtime.rest.messages.MessageHeaders;
 import org.apache.flink.runtime.rest.messages.MessageParameters;
 import org.apache.flink.runtime.rest.messages.RequestBody;
@@ -71,6 +75,13 @@ import org.apache.flink.runtime.rest.messages.checkpoints.CheckpointStatusMessag
 import org.apache.flink.runtime.rest.messages.checkpoints.CheckpointTriggerMessageParameters;
 import org.apache.flink.runtime.rest.messages.checkpoints.CheckpointingStatistics;
 import org.apache.flink.runtime.rest.messages.checkpoints.CheckpointingStatisticsHeaders;
+import org.apache.flink.runtime.rest.messages.job.JobDetailsHeaders;
+import org.apache.flink.runtime.rest.messages.job.JobDetailsInfo;
+import org.apache.flink.runtime.rest.messages.job.metrics.AggregatedMetric;
+import org.apache.flink.runtime.rest.messages.job.metrics.AggregatedMetricsResponseBody;
+import org.apache.flink.runtime.rest.messages.job.metrics.AggregatedSubtaskMetricsHeaders;
+import org.apache.flink.runtime.rest.messages.job.metrics.AggregatedSubtaskMetricsParameters;
+import org.apache.flink.runtime.rest.messages.job.metrics.IOMetricsInfo;
 import org.apache.flink.runtime.rest.messages.job.metrics.JobMetricsMessageParameters;
 import org.apache.flink.runtime.rest.messages.job.metrics.Metric;
 import org.apache.flink.runtime.rest.messages.job.metrics.MetricCollectionResponseBody;
@@ -134,6 +145,8 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutorService;
@@ -1523,5 +1536,279 @@ public class AbstractFlinkServiceTest {
         protected void deleteHAData(String namespace, String clusterId, Configuration conf) {
             haDeleted.add(Tuple2.of(namespace, clusterId));
         }
+    }
+
+    /**
+     * Exercises the real REST wiring of {@link AbstractFlinkService#getSourcePendingRecords}: the
+     * job-details request that discovers the vertices, the per-vertex aggregated-subtask metrics
+     * request filtered on {@code pendingRecords}, and the summing of the responses. Vertices not
+     * reporting the metric (non-sources, idle or legacy sources) must contribute zero.
+     */
+    @Test
+    public void getSourcePendingRecordsSumsSourceVertexMetrics() throws Exception {
+        var jobId = JobID.generate();
+        var sourceVertex = new JobVertexID();
+        var mapVertex = new JobVertexID();
+
+        var testingClusterClient = new TestingClusterClient<>(configuration, "test-cluster");
+        var queriedVertices = new ArrayList<String>();
+        testingClusterClient.setRequestProcessor(
+                (headers, parameters, requestBody) -> {
+                    if (headers instanceof JobDetailsHeaders) {
+                        return CompletableFuture.completedFuture(
+                                buildJobDetailsInfo(jobId, List.of(sourceVertex, mapVertex)));
+                    }
+                    if (headers instanceof AggregatedSubtaskMetricsHeaders) {
+                        var params = (AggregatedSubtaskMetricsParameters) parameters;
+                        var vertexId =
+                                params.getPathParameters().stream()
+                                        .filter(p -> p instanceof JobVertexIdPathParameter)
+                                        .map(p -> p.getValue().toString())
+                                        .findFirst()
+                                        .orElseThrow();
+                        queriedVertices.add(vertexId);
+                        // Only the source vertex reports pendingRecords, and the real REST
+                        // API prefixes the metric with its operator name
+                        if (vertexId.equals(sourceVertex.toString())) {
+                            return CompletableFuture.completedFuture(
+                                    new AggregatedMetricsResponseBody(
+                                            List.of(
+                                                    new AggregatedMetric(
+                                                            "Source__MySource.pendingRecords",
+                                                            null,
+                                                            null,
+                                                            null,
+                                                            1234.0,
+                                                            null))));
+                        }
+                        return CompletableFuture.completedFuture(
+                                new AggregatedMetricsResponseBody(List.of()));
+                    }
+                    fail("unexpected request: " + headers);
+                    return null;
+                });
+
+        var flinkService = new TestingService(testingClusterClient);
+
+        assertEquals(
+                OptionalLong.of(1234L),
+                flinkService.getSourcePendingRecords(configuration, jobId.toHexString()),
+                "the source vertex backlog must be returned, non-reporting vertices adding zero");
+        assertEquals(
+                2,
+                queriedVertices.size(),
+                "only the source vertex is queried - once to discover its metric names and once for"
+                        + " the value - while the downstream vertex is skipped entirely");
+    }
+
+    /**
+     * The aggregated metrics endpoint names the metric after its operator, so a filter on the bare
+     * name matches nothing. Returning nothing must read as unknown, never as a drained backlog -
+     * this is what let a premature cutover through on a real cluster.
+     */
+    @Test
+    public void getSourcePendingRecordsIsEmptyWhenNoOperatorReportsIt() throws Exception {
+        var jobId = JobID.generate();
+        var vertex = new JobVertexID();
+        var testingClusterClient = new TestingClusterClient<>(configuration, "test-cluster");
+        testingClusterClient.setRequestProcessor(
+                (headers, parameters, requestBody) -> {
+                    if (headers instanceof JobDetailsHeaders) {
+                        return CompletableFuture.completedFuture(
+                                buildJobDetailsInfo(jobId, List.of(vertex)));
+                    }
+                    // a vertex that only exposes unrelated metrics
+                    return CompletableFuture.completedFuture(
+                            new AggregatedMetricsResponseBody(
+                                    List.of(
+                                            new AggregatedMetric(
+                                                    "Sink__MySink.pendingCommittables",
+                                                    null,
+                                                    null,
+                                                    null,
+                                                    7.0,
+                                                    null))));
+                });
+
+        var flinkService = new TestingService(testingClusterClient);
+
+        assertEquals(
+                OptionalLong.empty(),
+                flinkService.getSourcePendingRecords(configuration, jobId.toHexString()),
+                "a job whose operators do not expose pendingRecords must report unknown");
+    }
+
+    /**
+     * Sources initialise the metric lazily on their first record, so an idle source never exposes
+     * it at all. Flink reads that as no pending records (see {@code ScalingMetrics}, which maps a
+     * missing metric to a lag of zero), so a partially reporting job must sum the reporters rather
+     * than read as unknown - otherwise a job with any permanently idle source could never cut over.
+     */
+    @Test
+    public void getSourcePendingRecordsCountsSilentSourcesAsDrained() throws Exception {
+        var jobId = JobID.generate();
+        var reportingSource = new JobVertexID();
+        var silentSource = new JobVertexID();
+
+        var testingClusterClient = new TestingClusterClient<>(configuration, "test-cluster");
+        testingClusterClient.setRequestProcessor(
+                (headers, parameters, requestBody) -> {
+                    if (headers instanceof JobDetailsHeaders) {
+                        return CompletableFuture.completedFuture(
+                                buildJobDetailsInfoWithSources(
+                                        jobId, List.of(reportingSource, silentSource), Set.of()));
+                    }
+                    var vertexId = queriedVertexId(parameters);
+                    if (vertexId.equals(reportingSource.toString())) {
+                        return CompletableFuture.completedFuture(
+                                new AggregatedMetricsResponseBody(
+                                        List.of(
+                                                new AggregatedMetric(
+                                                        "Source__Reporting.pendingRecords",
+                                                        null,
+                                                        null,
+                                                        null,
+                                                        0.0,
+                                                        null))));
+                    }
+                    return CompletableFuture.completedFuture(
+                            new AggregatedMetricsResponseBody(List.of()));
+                });
+
+        var flinkService = new TestingService(testingClusterClient);
+
+        assertEquals(
+                OptionalLong.of(0L),
+                flinkService.getSourcePendingRecords(configuration, jobId.toHexString()),
+                "the reporting source is drained and the silent source has no backlog to add");
+    }
+
+    /**
+     * A bounded source that has already finished cannot hold a backlog and never reports the
+     * metric, so requiring it to report would leave the backlog permanently unknown and stall every
+     * cutover until the drain timeout.
+     */
+    @Test
+    public void getSourcePendingRecordsIgnoresFinishedSources() throws Exception {
+        var jobId = JobID.generate();
+        var runningSource = new JobVertexID();
+        var finishedSource = new JobVertexID();
+
+        var testingClusterClient = new TestingClusterClient<>(configuration, "test-cluster");
+        var queriedVertices = new ArrayList<String>();
+        testingClusterClient.setRequestProcessor(
+                (headers, parameters, requestBody) -> {
+                    if (headers instanceof JobDetailsHeaders) {
+                        return CompletableFuture.completedFuture(
+                                buildJobDetailsInfoWithSources(
+                                        jobId,
+                                        List.of(runningSource, finishedSource),
+                                        Set.of(finishedSource)));
+                    }
+                    queriedVertices.add(queriedVertexId(parameters));
+                    return CompletableFuture.completedFuture(
+                            new AggregatedMetricsResponseBody(
+                                    List.of(
+                                            new AggregatedMetric(
+                                                    "Source__Running.pendingRecords",
+                                                    null,
+                                                    null,
+                                                    null,
+                                                    0.0,
+                                                    null))));
+                });
+
+        var flinkService = new TestingService(testingClusterClient);
+
+        assertEquals(
+                OptionalLong.of(0L),
+                flinkService.getSourcePendingRecords(configuration, jobId.toHexString()),
+                "the drained running source must be reported, the finished source ignored");
+        assertTrue(
+                queriedVertices.stream().noneMatch(v -> v.equals(finishedSource.toString())),
+                "a finished source must not be queried at all");
+    }
+
+    private static String queriedVertexId(MessageParameters parameters) {
+        return parameters.getPathParameters().stream()
+                .filter(p -> p instanceof JobVertexIdPathParameter)
+                .map(p -> p.getValue().toString())
+                .findFirst()
+                .orElseThrow();
+    }
+
+    /** Builds job details whose json plan makes every listed vertex an independent source. */
+    private static JobDetailsInfo buildJobDetailsInfoWithSources(
+            JobID jobId, List<JobVertexID> sources, Set<JobVertexID> finished) {
+        return buildJobDetailsInfo(jobId, sources, finished, true);
+    }
+
+    private static JobDetailsInfo buildJobDetailsInfo(JobID jobId, List<JobVertexID> vertices) {
+        return buildJobDetailsInfo(jobId, vertices, Set.of());
+    }
+
+    /**
+     * Builds job details whose json plan makes the first vertex a source (no inputs) and chains
+     * every later vertex behind it, so the topology derived from it distinguishes sources from
+     * downstream operators the way a real job plan does.
+     */
+    private static JobDetailsInfo buildJobDetailsInfo(
+            JobID jobId, List<JobVertexID> vertices, Set<JobVertexID> finished) {
+        return buildJobDetailsInfo(jobId, vertices, finished, false);
+    }
+
+    private static JobDetailsInfo buildJobDetailsInfo(
+            JobID jobId,
+            List<JobVertexID> vertices,
+            Set<JobVertexID> finished,
+            boolean allSources) {
+        var vertexInfos = new ArrayList<JobDetailsInfo.JobVertexDetailsInfo>();
+        for (var vertexId : vertices) {
+            vertexInfos.add(
+                    new JobDetailsInfo.JobVertexDetailsInfo(
+                            vertexId,
+                            null,
+                            vertexId.toString(),
+                            1,
+                            1,
+                            finished.contains(vertexId)
+                                    ? ExecutionState.FINISHED
+                                    : ExecutionState.RUNNING,
+                            0L,
+                            0L,
+                            0L,
+                            Map.of(),
+                            new IOMetricsInfo(
+                                    0, false, 0, false, 0, false, 0, false, 0L, 0L, 0.0)));
+        }
+        return new JobDetailsInfo(
+                jobId,
+                "test-job",
+                false,
+                org.apache.flink.api.common.JobStatus.RUNNING,
+                0L,
+                0L,
+                0L,
+                0L,
+                0L,
+                Map.of(),
+                vertexInfos,
+                Map.of(),
+                new JobPlanInfo.RawJson(buildJsonPlan(vertices, allSources)));
+    }
+
+    private static String buildJsonPlan(List<JobVertexID> vertices, boolean allSources) {
+        var nodes = new ArrayList<String>();
+        for (int i = 0; i < vertices.size(); i++) {
+            var inputs =
+                    (i == 0 || allSources)
+                            ? ""
+                            : String.format(
+                                    ",\"inputs\":[{\"id\":\"%s\",\"ship_strategy\":\"FORWARD\"}]",
+                                    vertices.get(0));
+            nodes.add(
+                    String.format("{\"id\":\"%s\",\"parallelism\":1%s}", vertices.get(i), inputs));
+        }
+        return "{\"nodes\":[" + String.join(",", nodes) + "]}";
     }
 }
