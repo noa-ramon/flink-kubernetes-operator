@@ -75,6 +75,7 @@ import static org.apache.flink.kubernetes.operator.api.utils.BaseTestUtils.SAMPL
 import static org.apache.flink.kubernetes.operator.api.utils.BaseTestUtils.TEST_DEPLOYMENT_NAME;
 import static org.apache.flink.kubernetes.operator.api.utils.BaseTestUtils.TEST_NAMESPACE;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.instantStrToMillis;
+import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.millisToInstantStr;
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -550,7 +551,9 @@ public class FlinkBlueGreenDeploymentControllerTest {
         assertEquals(
                 ReconciliationState.UPGRADING,
                 flinkDeployments.get(1).getStatus().getReconciliationStatus().getState());
-        assertTrue(instantStrToMillis(rs.reconciledStatus.getAbortTimestamp()) > 0);
+        // Cleared with the rest of the transition markers: an ended transition must not leave a
+        // clock behind for the next one to inherit (matches upstream main).
+        assertEquals(0, instantStrToMillis(rs.reconciledStatus.getAbortTimestamp()));
         // savepointTriggerId must be cleared on abort so the next transition
         // triggers a fresh savepoint instead of reusing a stale triggerId
         assertNull(rs.reconciledStatus.getSavepointTriggerId());
@@ -1798,6 +1801,19 @@ public class FlinkBlueGreenDeploymentControllerTest {
         rs = abortRef.get();
 
         assertFailingJobStatus(rs);
+        // An abort ends the transition, so it must clear the markers that scope it. The ready
+        // timestamp is the origin of the hold clock, the settle window and the drain timeout, so
+        // leaving the aborted attempt's value behind pre-expires all three on the next transition:
+        // it would start with a stale clock, treat an absent metric as idle rather than unknown,
+        // and cut over before a single sample had been read.
+        assertEquals(
+                millisToInstantStr(0),
+                rs.reconciledStatus.getDeploymentReadyTimestamp(),
+                "an aborted transition must not leak its ready timestamp to the next one");
+        assertEquals(
+                millisToInstantStr(0),
+                rs.reconciledStatus.getAbortTimestamp(),
+                "an aborted transition must not leak its abort timestamp to the next one");
         assertEquals(
                 2, getFlinkDeployments().size(), "the failed deployment is kept for inspection");
         assertEquals(
@@ -1952,6 +1968,82 @@ public class FlinkBlueGreenDeploymentControllerTest {
         assertEquals(
                 FlinkBlueGreenDeploymentState.ACTIVE_GREEN,
                 rs.reconciledStatus.getBlueGreenState());
+    }
+
+    /**
+     * A transition that follows an aborted one must start its hold clock from zero. The ready
+     * timestamp is only ever stamped when it reads zero, so a value left behind by the abort is
+     * never replaced - the next transition would compute its settle window and its drain deadline
+     * from the previous attempt's clock and promote before observing anything.
+     */
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyAbortDoesNotDisarmTheFollowingTransition(FlinkVersion flinkVersion)
+            throws Exception {
+        var blueGreenDeployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        flinkVersion,
+                        null,
+                        UpgradeMode.SAVEPOINT);
+
+        Map<String, String> configuration = blueGreenDeployment.getSpec().getConfiguration();
+        configuration.put(CUTOVER_WAIT_FOR_SOURCE_DRAIN.key(), "true");
+        configuration.put(CUTOVER_DRAIN_TIMEOUT.key(), "1");
+        configuration.put(DEPLOYMENT_DELETION_DELAY.key(), "0");
+        configuration.put(RECONCILIATION_RESCHEDULING_INTERVAL.key(), "5000");
+        configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
+
+        var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+
+        // Transition 1: a backlog that never drains, with a timeout that expires at once
+        flinkService.setPendingRecords(5000L);
+        simulateChangeInSpec(rs.deployment, UUID.randomUUID().toString(), 0, null);
+        rs = handleSavepoint(rs);
+        rs = reconcile(rs.deployment);
+        simulateSuccessfulJobStart(getFlinkDeployments().get(1));
+        rs = reconcile(rs.deployment);
+
+        var abortRef = new AtomicReference<>(rs);
+        await().atMost(10, TimeUnit.SECONDS)
+                .pollInterval(100, TimeUnit.MILLISECONDS)
+                .untilAsserted(
+                        () -> {
+                            abortRef.set(reconcile(abortRef.get().deployment));
+                            assertEquals(
+                                    FlinkBlueGreenDeploymentState.ACTIVE_BLUE,
+                                    abortRef.get().reconciledStatus.getBlueGreenState());
+                        });
+        rs = abortRef.get();
+
+        // Transition 2: any later transition - the deliberate redeploy after fixing the cause, or
+        // an unrelated change days on. Give it a real budget, and let the metric be absent: the
+        // state a job is in before its first record, when its backlog is largest.
+        // Nothing retries on its own - a person diagnoses the abort and pushes a new spec. Any
+        // gap longer than the settle window is enough for an inherited clock to read as settled,
+        // and the leak is not scoped to a deliberate retry: it poisons every later transition.
+        Thread.sleep(2 * 5000 + 1000);
+
+        rs.deployment.getSpec().getConfiguration().put(CUTOVER_DRAIN_TIMEOUT.key(), "600000");
+        flinkService.setPendingRecordsUnreported();
+
+        simulateChangeInSpec(rs.deployment, UUID.randomUUID().toString(), 0, null);
+        rs = handleSavepoint(rs);
+        rs = reconcile(rs.deployment);
+        simulateSuccessfulJobStart(getFlinkDeployments().get(1));
+        rs = reconcile(rs.deployment);
+        rs = reconcile(rs.deployment);
+
+        assertEquals(
+                2,
+                getFlinkDeployments().size(),
+                "a transition following an abort must hold: with a fresh clock an absent metric"
+                        + " inside the settle window is unknown, not idle");
+        assertEquals(
+                FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN,
+                rs.reconciledStatus.getBlueGreenState(),
+                "a later transition must not finalize on an inherited clock");
     }
 
     /** A zero read on the very first check after readiness must not be enough to cut over. */

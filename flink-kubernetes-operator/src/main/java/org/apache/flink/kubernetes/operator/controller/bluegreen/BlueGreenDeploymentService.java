@@ -24,6 +24,7 @@ import org.apache.flink.kubernetes.operator.api.bluegreen.BlueGreenDeploymentTyp
 import org.apache.flink.kubernetes.operator.api.bluegreen.BlueGreenDiffType;
 import org.apache.flink.kubernetes.operator.api.lifecycle.ResourceLifecycleState;
 import org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState;
+import org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentStatus;
 import org.apache.flink.kubernetes.operator.api.status.Savepoint;
 import org.apache.flink.kubernetes.operator.api.status.SavepointFormatType;
 import org.apache.flink.kubernetes.operator.api.status.SnapshotTriggerType;
@@ -513,9 +514,7 @@ public class BlueGreenDeploymentService {
                 context.getDeploymentName(),
                 nextState);
 
-        context.getDeploymentStatus().setDeploymentReadyTimestamp(millisToInstantStr(0));
-        context.getDeploymentStatus().setAbortTimestamp(millisToInstantStr(0));
-        context.getDeploymentStatus().setSavepointTriggerId(null);
+        resetTransitionMarkers(context.getDeploymentStatus());
 
         return patchStatusUpdateControl(context, nextState, JobStatus.SUSPENDED, null)
                 .rescheduleAfter(0);
@@ -865,7 +864,7 @@ public class BlueGreenDeploymentService {
         FlinkBlueGreenDeploymentState previousState =
                 getPreviousState(nextState, context.getDeployments());
         context.getDeploymentStatus().setBlueGreenState(previousState);
-        context.getDeploymentStatus().setSavepointTriggerId(null);
+        resetTransitionMarkers(context.getDeploymentStatus());
 
         var error =
                 String.format(
@@ -911,9 +910,7 @@ public class BlueGreenDeploymentService {
 
         LOG.info("Finalizing deployment '{}' to {} state", context.getDeploymentName(), nextState);
 
-        context.getDeploymentStatus().setDeploymentReadyTimestamp(millisToInstantStr(0));
-        context.getDeploymentStatus().setAbortTimestamp(millisToInstantStr(0));
-        context.getDeploymentStatus().setSavepointTriggerId(null);
+        resetTransitionMarkers(context.getDeploymentStatus());
 
         updateBlueGreenIngress(context, nextState);
 
@@ -994,6 +991,18 @@ public class BlueGreenDeploymentService {
     }
 
     // ==================== Common Utility Methods ====================
+
+    /**
+     * Clears the markers that scope a transition, so the next one starts from a zero stopwatch.
+     * Every path that ends a transition must call this: the deployment ready timestamp is the
+     * origin of the cutover gate's hold clock, its settle window and its drain timeout, so a value
+     * left behind by one transition silently pre-expires all three on the next.
+     */
+    private static void resetTransitionMarkers(FlinkBlueGreenDeploymentStatus status) {
+        status.setDeploymentReadyTimestamp(millisToInstantStr(0));
+        status.setAbortTimestamp(millisToInstantStr(0));
+        status.setSavepointTriggerId(null);
+    }
 
     public static UpdateControl<FlinkBlueGreenDeployment> patchStatusUpdateControl(
             BlueGreenContext context,
