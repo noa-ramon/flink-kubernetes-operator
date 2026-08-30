@@ -2278,6 +2278,82 @@ public class FlinkBlueGreenDeploymentControllerTest {
                 "a full window of readings from the same incarnation completes the drain");
     }
 
+    /**
+     * The savepoint trigger id is a baton: SAVEPOINTING stores it and returns to ACTIVE, where the
+     * still-unreconciled diff consumes it. If the spec reverts in that gap - an external controller
+     * undoing the change - the diff reads IGNORE and the baton is orphaned. It must be cleared then
+     * and there: left in place it outlives the JobManager's completed-operation cache, and the next
+     * real transition, possibly days later, fetches a trigger the JobManager no longer knows and
+     * fails before it starts. Observed live: a trigger from 2026-08-28 failed the transition of
+     * 2026-08-30.
+     */
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyRevertedTransitionDoesNotOrphanTheSavepointTrigger(FlinkVersion flinkVersion)
+            throws Exception {
+        var blueGreenDeployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        flinkVersion,
+                        null,
+                        UpgradeMode.SAVEPOINT);
+        blueGreenDeployment.getSpec().getConfiguration().put(DEPLOYMENT_DELETION_DELAY.key(), "0");
+        var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+
+        // A transition starts and its savepoint completes...
+        simulateChangeInSpec(rs.deployment, UUID.randomUUID().toString(), 0, null);
+        var triggers = flinkService.getSavepointTriggers();
+        triggers.clear();
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.SAVEPOINTING_BLUE,
+                rs.reconciledStatus.getBlueGreenState());
+        String triggerId = rs.deployment.getStatus().getSavepointTriggerId();
+        triggers.put(triggerId, true);
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_BLUE,
+                rs.reconciledStatus.getBlueGreenState(),
+                "a completed savepoint hands the transition back to the active state");
+
+        // ...but the spec reverts before the savepoint is consumed (an external controller
+        // restoring the previous state removes the custom field entirely)
+        rs.deployment
+                .getSpec()
+                .getTemplate()
+                .getSpec()
+                .getFlinkConfiguration()
+                .remove(CUSTOM_CONFIG_FIELD);
+        rs = reconcile(rs.deployment);
+
+        assertNull(
+                rs.reconciledStatus.getSavepointTriggerId(),
+                "a reverted transition must not orphan its savepoint trigger id");
+        assertEquals(1, getFlinkDeployments().size(), "no second deployment was created");
+
+        // and the next real transition must start cleanly on a fresh savepoint
+        simulateChangeInSpec(rs.deployment, UUID.randomUUID().toString(), 0, null);
+        rs = handleSavepoint(rs);
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                2,
+                getFlinkDeployments().size(),
+                "the next transition must create its child from a fresh savepoint");
+        simulateSuccessfulJobStart(getFlinkDeployments().get(1));
+        for (int i = 0;
+                i < 6
+                        && rs.reconciledStatus.getBlueGreenState()
+                                != FlinkBlueGreenDeploymentState.ACTIVE_GREEN;
+                i++) {
+            rs = reconcile(rs.deployment);
+        }
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_GREEN,
+                rs.reconciledStatus.getBlueGreenState(),
+                "the transition after a reverted one must complete normally");
+    }
+
     /** A zero read on the very first check after readiness must not be enough to cut over. */
     @ParameterizedTest
     @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")

@@ -128,6 +128,25 @@ public class BlueGreenDeploymentService {
 
         BlueGreenDiffType specDiff = getSpecDiff(context);
 
+        if (specDiff == BlueGreenDiffType.IGNORE
+                && context.getDeploymentStatus().getSavepointTriggerId() != null) {
+            // The savepoint trigger id is a baton: SAVEPOINTING stores it and returns to ACTIVE,
+            // where the still-unreconciled spec diff re-enters this method and consumes it. If the
+            // spec reverted in between (an external controller undoing the change), the diff reads
+            // IGNORE, the baton is never consumed and it outlives the JobManager's completed
+            // operation cache - so the next real transition, possibly days later, fetches a
+            // trigger the JobManager no longer knows and fails before it starts. No pending diff
+            // means any stored trigger id is stale: drop it with the other transition markers.
+            LOG.info(
+                    "Clearing stale savepoint trigger id '{}' for '{}': the transition it belonged"
+                            + " to was reverted before the savepoint was consumed.",
+                    context.getDeploymentStatus().getSavepointTriggerId(),
+                    context.getDeploymentName());
+            resetTransitionMarkers(context.getDeploymentStatus());
+            return patchStatusUpdateControl(context, null, null, null)
+                    .rescheduleAfter(getReconciliationReschedInterval(context));
+        }
+
         if (specDiff != BlueGreenDiffType.IGNORE) {
             FlinkDeployment currentFlinkDeployment =
                     context.getDeploymentByType(currentBlueGreenDeploymentType);
