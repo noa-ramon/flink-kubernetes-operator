@@ -102,8 +102,9 @@ summed over its running sources) has read as continuously empty for
 measured from the first zero reading of the current incarnation of the job - never from wall time
 alone: a single reading is not evidence, since sources initialize `pendingRecords` lazily and a
 restart wipes the gauge. The window restarts whenever a non-zero backlog is read, no source
-reports the metric, the job or one of its source vertices restarts, or the set of reporting
-sources changes.
+reports the metric, the metric cannot be read at all, the job is not observably running, the job
+or one of its source vertices restarts, or the set of reporting sources changes - continuity is a
+claim about observations, and any gap in them starts it over.
 
 `kubernetes.operator.bluegreen.cutover.drain-timeout` (default 1h) bounds the wait, measured from
 the moment the new deployment became ready. On expiry the transition is aborted: the new deployment
