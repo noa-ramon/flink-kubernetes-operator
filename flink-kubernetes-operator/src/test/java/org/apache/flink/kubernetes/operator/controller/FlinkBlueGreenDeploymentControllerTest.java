@@ -2075,8 +2075,12 @@ public class FlinkBlueGreenDeploymentControllerTest {
 
         Map<String, String> configuration = blueGreenDeployment.getSpec().getConfiguration();
         configuration.put(CUTOVER_WAIT_FOR_SOURCE_DRAIN.key(), "true");
-        // already expired by the time the first verdict is taken
+        // already expired by the time the first verdict is taken, while the zero-length
+        // confirmation window makes the same evaluation eligible for cutover - the abort
+        // below therefore proves the deadline is checked first, not that the backlog was
+        // simply unconfirmed
         configuration.put(CUTOVER_DRAIN_TIMEOUT.key(), "1");
+        configuration.put(CUTOVER_DRAIN_CONFIRMATION_WINDOW.key(), "0");
         configuration.put(DEPLOYMENT_DELETION_DELAY.key(), "0");
         configuration.put(RECONCILIATION_RESCHEDULING_INTERVAL.key(), "100");
         configuration.put(ABORT_GRACE_PERIOD.key(), "60000");

@@ -82,7 +82,8 @@ public class FlinkBlueGreenDeploymentConfigOptions {
                                     + " event time pipelines with a bounded allowed lateness, deleting the previous"
                                     + " deployment during that catch-up leaves those records without a producer."
                                     + " Requires sources exposing the pendingRecords metric (e.g. KafkaSource);"
-                                    + " sources not reporting it are treated as having no pending records.");
+                                    + " a job where no source reports it never confirms as drained and the"
+                                    + " transition is aborted once cutover.drain-timeout expires.");
 
     public static final ConfigOption<Duration> CUTOVER_DRAIN_TIMEOUT =
             operatorConfig("cutover.drain-timeout")
