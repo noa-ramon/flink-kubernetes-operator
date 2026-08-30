@@ -1889,9 +1889,7 @@ public class AbstractFlinkServiceTest {
                 snapshot.getPendingRecords(),
                 "a zero straddling a source restart must be discarded, not reported as drained");
         assertEquals(
-                0L,
-                snapshot.getJobRunningTimestamp(),
-                "a discarded reading must carry no anchor");
+                0L, snapshot.getJobRunningTimestamp(), "a discarded reading must carry no anchor");
     }
 
     private static String queriedVertexId(MessageParameters parameters) {
