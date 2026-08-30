@@ -57,13 +57,14 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
 import java.io.IOException;
+import java.time.Clock;
 import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import static org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentConfigOptions.ABORT_GRACE_PERIOD;
@@ -77,7 +78,6 @@ import static org.apache.flink.kubernetes.operator.api.utils.BaseTestUtils.TEST_
 import static org.apache.flink.kubernetes.operator.api.utils.BaseTestUtils.TEST_NAMESPACE;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.instantStrToMillis;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.millisToInstantStr;
-import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -1694,6 +1694,45 @@ public class FlinkBlueGreenDeploymentControllerTest {
     // ==================== Cutover source-drain gate ====================
 
     /**
+     * A mutable {@link Clock} the gate tests drive explicitly. Every read ticks it forward by a
+     * millisecond, the way a wall clock never reads the same instant twice, and the window and
+     * deadline crossings are driven by {@link #advance} instead of sleeping against real time.
+     */
+    private static final class SteppingClock extends Clock {
+        private long millis = System.currentTimeMillis();
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            return this;
+        }
+
+        @Override
+        public Instant instant() {
+            millis += 1;
+            return Instant.ofEpochMilli(millis);
+        }
+
+        void advance(long millisToAdd) {
+            millis += millisToAdd;
+        }
+    }
+
+    private SteppingClock useSteppingClock() {
+        var clock = new SteppingClock();
+        testController
+                .flinkBlueGreenDeploymentController
+                .getHandlerRegistry()
+                .getDeploymentService()
+                .setClock(clock);
+        return clock;
+    }
+
+    /**
      * With the drain gate enabled, the previous deployment must be kept alive while the new
      * deployment still reports pending records, and deleted once the backlog is drained.
      */
@@ -1717,6 +1756,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
 
         var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+        var clock = useSteppingClock();
 
         // Green reports a backlog first, then drains on the following check
         flinkService.setPendingRecords(500L, 0L, 0L, 0L);
@@ -1749,7 +1789,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         rs = reconcile(rs.deployment);
         assertEquals(2, getFlinkDeployments().size(), "a zero inside the window must not cut over");
         // Drain check #4: the backlog has read empty across the whole window
-        Thread.sleep(350);
+        clock.advance(350);
         rs = reconcile(rs.deployment);
         assertEquals(
                 1,
@@ -1787,6 +1827,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
 
         var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+        var clock = useSteppingClock();
 
         // Green never drains
         flinkService.setPendingRecords(1_000L);
@@ -1797,17 +1838,18 @@ public class FlinkBlueGreenDeploymentControllerTest {
         simulateSuccessfulJobStart(getFlinkDeployments().get(1));
         rs = reconcile(rs.deployment);
 
-        var abortRef = new AtomicReference<>(rs);
-        await().atMost(10, TimeUnit.SECONDS)
-                .pollInterval(100, TimeUnit.MILLISECONDS)
-                .untilAsserted(
-                        () -> {
-                            abortRef.set(reconcile(abortRef.get().deployment));
-                            assertEquals(
-                                    FlinkBlueGreenDeploymentState.ACTIVE_BLUE,
-                                    abortRef.get().reconciledStatus.getBlueGreenState());
-                        });
-        rs = abortRef.get();
+        clock.advance(1000);
+        for (int i = 0;
+                i < 5
+                        && rs.reconciledStatus.getBlueGreenState()
+                                != FlinkBlueGreenDeploymentState.ACTIVE_BLUE;
+                i++) {
+            rs = reconcile(rs.deployment);
+        }
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_BLUE,
+                rs.reconciledStatus.getBlueGreenState(),
+                "the drain deadline must abort the transition");
 
         assertFailingJobStatus(rs);
         // An abort ends the transition, so it must clear the markers that scope it. The ready
@@ -1854,6 +1896,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
 
         var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+        var clock = useSteppingClock();
 
         // A large backlog that would block the gate if it were enabled
         flinkService.setPendingRecords(1_000_000L);
@@ -1903,6 +1946,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
 
         var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+        var clock = useSteppingClock();
 
         // No source reports the metric at all - the state the real cluster was in right after the
         // child became ready
@@ -1951,6 +1995,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
 
         var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+        var clock = useSteppingClock();
 
         flinkService.setPendingRecordsUnreported();
 
@@ -1960,17 +2005,18 @@ public class FlinkBlueGreenDeploymentControllerTest {
         simulateSuccessfulJobStart(getFlinkDeployments().get(1));
         rs = reconcile(rs.deployment);
 
-        var abortRef = new AtomicReference<>(rs);
-        await().atMost(10, TimeUnit.SECONDS)
-                .pollInterval(100, TimeUnit.MILLISECONDS)
-                .untilAsserted(
-                        () -> {
-                            abortRef.set(reconcile(abortRef.get().deployment));
-                            assertEquals(
-                                    FlinkBlueGreenDeploymentState.ACTIVE_BLUE,
-                                    abortRef.get().reconciledStatus.getBlueGreenState());
-                        });
-        rs = abortRef.get();
+        clock.advance(1000);
+        for (int i = 0;
+                i < 5
+                        && rs.reconciledStatus.getBlueGreenState()
+                                != FlinkBlueGreenDeploymentState.ACTIVE_BLUE;
+                i++) {
+            rs = reconcile(rs.deployment);
+        }
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_BLUE,
+                rs.reconciledStatus.getBlueGreenState(),
+                "the drain deadline must abort the transition");
 
         assertFailingJobStatus(rs);
         assertEquals(
@@ -2005,6 +2051,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
 
         var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+        var clock = useSteppingClock();
 
         // Transition 1: a backlog that never drains, with a timeout that expires at once
         flinkService.setPendingRecords(5000L);
@@ -2014,17 +2061,18 @@ public class FlinkBlueGreenDeploymentControllerTest {
         simulateSuccessfulJobStart(getFlinkDeployments().get(1));
         rs = reconcile(rs.deployment);
 
-        var abortRef = new AtomicReference<>(rs);
-        await().atMost(10, TimeUnit.SECONDS)
-                .pollInterval(100, TimeUnit.MILLISECONDS)
-                .untilAsserted(
-                        () -> {
-                            abortRef.set(reconcile(abortRef.get().deployment));
-                            assertEquals(
-                                    FlinkBlueGreenDeploymentState.ACTIVE_BLUE,
-                                    abortRef.get().reconciledStatus.getBlueGreenState());
-                        });
-        rs = abortRef.get();
+        clock.advance(1000);
+        for (int i = 0;
+                i < 5
+                        && rs.reconciledStatus.getBlueGreenState()
+                                != FlinkBlueGreenDeploymentState.ACTIVE_BLUE;
+                i++) {
+            rs = reconcile(rs.deployment);
+        }
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_BLUE,
+                rs.reconciledStatus.getBlueGreenState(),
+                "the drain deadline must abort the transition");
 
         // Transition 2: any later transition - the deliberate redeploy after fixing the cause, or
         // an unrelated change days on. Give it a real budget, and let the metric be absent: the
@@ -2032,7 +2080,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         // Nothing retries on its own - a person diagnoses the abort and pushes a new spec. Any
         // gap longer than the settle window is enough for an inherited clock to read as settled,
         // and the leak is not scoped to a deliberate retry: it poisons every later transition.
-        Thread.sleep(2 * 5000 + 1000);
+        clock.advance(2 * 5000 + 1000);
 
         rs.deployment.getSpec().getConfiguration().put(CUTOVER_DRAIN_TIMEOUT.key(), "600000");
         flinkService.setPendingRecordsUnreported();
@@ -2086,6 +2134,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
 
         var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+        var clock = useSteppingClock();
 
         // a drained backlog, settled - everything the cutover path wants
         flinkService.setPendingRecords(0L);
@@ -2095,7 +2144,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         rs = reconcile(rs.deployment);
         simulateSuccessfulJobStart(getFlinkDeployments().get(1));
         rs = reconcile(rs.deployment);
-        Thread.sleep(300);
+        clock.advance(300);
         rs = reconcile(rs.deployment);
 
         assertEquals(
@@ -2142,6 +2191,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
 
         var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+        var clock = useSteppingClock();
 
         // The incoming job reports a large real backlog on the first evaluation...
         flinkService.setPendingRecords(43471L);
@@ -2157,7 +2207,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         // ...then its TaskManagers restart: the gauge is wiped and, being lazily initialised,
         // stays absent until the next record is read. No zero has ever been observed.
         flinkService.setPendingRecordsUnreported();
-        Thread.sleep(300); // wall time alone satisfies the clock-based settle window
+        clock.advance(300); // wall time alone satisfies the clock-based settle window
 
         rs = reconcile(rs.deployment);
 
@@ -2189,6 +2239,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
 
         var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+        var clock = useSteppingClock();
 
         flinkService.setPendingRecordsThrows(true);
 
@@ -2198,7 +2249,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         simulateSuccessfulJobStart(getFlinkDeployments().get(1));
         rs = reconcile(rs.deployment);
         // well past the settle window: elapsed time alone must never turn a failure into a drain
-        Thread.sleep(300);
+        clock.advance(300);
         rs = reconcile(rs.deployment);
         rs = reconcile(rs.deployment);
 
@@ -2216,7 +2267,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         flinkService.setPendingRecordsThrows(false);
         flinkService.setPendingRecords(0L);
         rs = reconcile(rs.deployment);
-        Thread.sleep(350);
+        clock.advance(350);
         rs = reconcile(rs.deployment);
         rs = reconcile(rs.deployment);
         assertEquals(
@@ -2251,6 +2302,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
 
         var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+        var clock = useSteppingClock();
 
         flinkService.setPendingRecords(0L);
 
@@ -2263,7 +2315,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         // the first zero starts the window, and most of it passes...
         rs = reconcile(rs.deployment);
         assertEquals(2, getFlinkDeployments().size(), "the window has only just started");
-        Thread.sleep(350);
+        clock.advance(350);
 
         // ...then the incoming job restarts: the readings the window was built on came from a
         // gauge that no longer exists
@@ -2274,7 +2326,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
                 2,
                 getFlinkDeployments().size(),
                 "a reading from a new incarnation must restart the window, not complete it");
-        Thread.sleep(350);
+        clock.advance(350);
         rs = reconcile(rs.deployment);
         assertEquals(
                 1,
@@ -2304,6 +2356,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
                         UpgradeMode.SAVEPOINT);
         blueGreenDeployment.getSpec().getConfiguration().put(DEPLOYMENT_DELETION_DELAY.key(), "0");
         var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+        var clock = useSteppingClock();
 
         // A transition starts and its savepoint completes...
         simulateChangeInSpec(rs.deployment, UUID.randomUUID().toString(), 0, null);
@@ -2384,6 +2437,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
 
         var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+        var clock = useSteppingClock();
 
         flinkService.setPendingRecords(0L);
         simulateChangeInSpec(rs.deployment, UUID.randomUUID().toString(), 0, null);
@@ -2395,7 +2449,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         // the window opens on a real zero, then the metric becomes unreadable across it
         rs = reconcile(rs.deployment);
         flinkService.setPendingRecordsThrows(true);
-        Thread.sleep(350);
+        clock.advance(350);
         rs = reconcile(rs.deployment);
         assertEquals(2, getFlinkDeployments().size(), "an unreadable stretch must hold");
 
@@ -2407,7 +2461,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
                 getFlinkDeployments().size(),
                 "a zero following a blind gap must restart the window, not complete it");
 
-        Thread.sleep(350);
+        clock.advance(350);
         rs = reconcile(rs.deployment);
         rs = reconcile(rs.deployment);
         assertEquals(
@@ -2441,6 +2495,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
 
         var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+        var clock = useSteppingClock();
 
         flinkService.setPendingRecords(0L);
         flinkService.setJobRunningTimestamp(0L);
@@ -2452,7 +2507,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
 
         // zeros with no RUNNING timestamp, spanning far more wall time than the window
         rs = reconcile(rs.deployment);
-        Thread.sleep(350);
+        clock.advance(350);
         rs = reconcile(rs.deployment);
         rs = reconcile(rs.deployment);
         assertEquals(
@@ -2464,7 +2519,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         flinkService.setJobRunningTimestamp(7L);
         rs = reconcile(rs.deployment);
         assertEquals(2, getFlinkDeployments().size(), "the first countable zero only opens it");
-        Thread.sleep(350);
+        clock.advance(350);
         rs = reconcile(rs.deployment);
         rs = reconcile(rs.deployment);
         assertEquals(
@@ -2495,6 +2550,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
 
         var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+        var clock = useSteppingClock();
 
         flinkService.setPendingRecords(0L);
 
@@ -2510,5 +2566,64 @@ public class FlinkBlueGreenDeploymentControllerTest {
                 2,
                 getFlinkDeployments().size(),
                 "a zero read inside the settle window must not trigger the cutover");
+    }
+
+    /**
+     * The gate is only entered after the deployment deletion delay, so the drain deadline is
+     * anchored there. Anchored at readiness, a delay longer than the drain timeout would expire the
+     * deadline before the first backlog reading is ever taken and abort a healthy transition on
+     * entry.
+     */
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyDeletionDelayDoesNotConsumeTheDrainTimeout(FlinkVersion flinkVersion)
+            throws Exception {
+        var blueGreenDeployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        flinkVersion,
+                        null,
+                        UpgradeMode.SAVEPOINT);
+
+        Map<String, String> configuration = blueGreenDeployment.getSpec().getConfiguration();
+        configuration.put(CUTOVER_WAIT_FOR_SOURCE_DRAIN.key(), "true");
+        // the delay alone outlasts the drain timeout: anchored at readiness, the deadline
+        // would already be expired at the gate's first evaluation
+        configuration.put(CUTOVER_DRAIN_TIMEOUT.key(), "500");
+        configuration.put(CUTOVER_DRAIN_CONFIRMATION_WINDOW.key(), "300");
+        configuration.put(DEPLOYMENT_DELETION_DELAY.key(), "2000");
+        configuration.put(RECONCILIATION_RESCHEDULING_INTERVAL.key(), "100");
+        configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
+
+        var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+        var clock = useSteppingClock();
+
+        flinkService.setPendingRecords(0L);
+
+        simulateChangeInSpec(rs.deployment, UUID.randomUUID().toString(), 0, null);
+        rs = handleSavepoint(rs);
+        rs = reconcile(rs.deployment);
+        simulateSuccessfulJobStart(getFlinkDeployments().get(1));
+        // marks the new deployment ready and arms the deletion delay
+        rs = reconcile(rs.deployment);
+        // the delay elapses; measured from readiness the drain timeout is long expired by now
+        clock.advance(2000);
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN,
+                rs.reconciledStatus.getBlueGreenState(),
+                "the deletion delay must not consume the drain timeout: the first evaluation"
+                        + " opens the confirmation window instead of aborting");
+        assertEquals(2, getFlinkDeployments().size());
+
+        // the confirmation window passes with the deadline still open
+        clock.advance(350);
+        rs = reconcile(rs.deployment);
+        assertEquals(1, getFlinkDeployments().size(), "the drained backlog completes the cutover");
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_GREEN,
+                rs.reconciledStatus.getBlueGreenState());
     }
 }

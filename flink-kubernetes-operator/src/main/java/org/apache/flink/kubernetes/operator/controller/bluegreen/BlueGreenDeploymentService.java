@@ -17,6 +17,7 @@
 
 package org.apache.flink.kubernetes.operator.controller.bluegreen;
 
+import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.kubernetes.operator.api.FlinkBlueGreenDeployment;
 import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
@@ -48,6 +49,7 @@ import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
@@ -79,6 +81,16 @@ public class BlueGreenDeploymentService {
     private static final Logger LOG = LoggerFactory.getLogger(BlueGreenDeploymentService.class);
     private static final long RETRY_DELAY_MS = 500;
     private static final Duration CUTOVER_EVENT_INTERVAL = Duration.ofMinutes(1);
+
+    // Every time comparison in this class goes through this clock so tests can drive the
+    // deletion delay, the confirmation window and the drain deadline deterministically
+    // instead of sleeping against the wall clock.
+    private Clock clock = Clock.systemUTC();
+
+    @VisibleForTesting
+    public void setClock(Clock clock) {
+        this.clock = clock;
+    }
 
     // ==================== Deployment Initiation Methods ====================
 
@@ -617,7 +629,7 @@ public class BlueGreenDeploymentService {
         var deploymentStatus = context.getDeploymentStatus();
 
         if (currentDeployment == null) {
-            deploymentStatus.setDeploymentReadyTimestamp(Instant.now().toString());
+            deploymentStatus.setDeploymentReadyTimestamp(Instant.now(clock).toString());
             return finalizeBlueGreenDeployment(context, nextState);
         }
 
@@ -631,14 +643,14 @@ public class BlueGreenDeploymentService {
                     nextDeployment.getMetadata().getName(),
                     deploymentDeletionDelayMs / 1000);
 
-            deploymentStatus.setDeploymentReadyTimestamp(Instant.now().toString());
+            deploymentStatus.setDeploymentReadyTimestamp(Instant.now(clock).toString());
             return patchStatusUpdateControl(context, null, null, null)
                     .rescheduleAfter(deploymentDeletionDelayMs);
         }
 
         long deletionTimestamp = deploymentReadyTimestamp + deploymentDeletionDelayMs;
 
-        if (deletionTimestamp < System.currentTimeMillis()) {
+        if (deletionTimestamp < clock.millis()) {
             if (isWaitForSourceDrainEnabled(context)) {
                 return handleSourceDrain(
                         context,
@@ -753,7 +765,7 @@ public class BlueGreenDeploymentService {
                 drainConfirmations.remove(confirmationKey);
                 notDrainedReason = "the job is not observably running";
             } else {
-                long now = System.currentTimeMillis();
+                long now = clock.millis();
                 DrainConfirmation previous = drainConfirmations.get(confirmationKey);
                 boolean sameIncarnation =
                         previous != null
@@ -779,9 +791,15 @@ public class BlueGreenDeploymentService {
             }
         }
 
-        long heldFor = System.currentTimeMillis() - deploymentReadyTimestamp;
-        long drainDeadline = deploymentReadyTimestamp + getCutoverDrainTimeout(context);
-        boolean pastDeadline = drainDeadline < System.currentTimeMillis();
+        long heldFor = clock.millis() - deploymentReadyTimestamp;
+        // The gate is only entered after the deployment deletion delay has elapsed, so the
+        // deadline is anchored there rather than at readiness: anchored at readiness, a delay
+        // longer than the drain timeout would expire the deadline before the first backlog
+        // reading is ever taken and abort a healthy transition on entry.
+        long gateOpenTimestamp =
+                deploymentReadyTimestamp + BlueGreenUtils.getDeploymentDeletionDelay(context);
+        long drainDeadline = gateOpenTimestamp + getCutoverDrainTimeout(context);
+        boolean pastDeadline = drainDeadline < clock.millis();
 
         // One audit record per evaluation, so the drain can be reconstructed from the operator log
         // alone: a gate that decides when the previous deployment stops producing has to leave
@@ -801,7 +819,7 @@ public class BlueGreenDeploymentService {
                 zeroConfirmedFor / 1000,
                 confirmationWindow / 1000,
                 heldFor / 1000,
-                Math.max(0, drainDeadline - System.currentTimeMillis()) / 1000,
+                Math.max(0, drainDeadline - clock.millis()) / 1000,
                 pastDeadline ? "ABORT" : (notDrainedReason == null ? "CUTOVER" : "HOLD"),
                 notDrainedReason == null ? "" : " (" + notDrainedReason + ")");
 
@@ -847,7 +865,7 @@ public class BlueGreenDeploymentService {
                         nextDeploymentName,
                         notDrainedReason,
                         currentDeployment.getMetadata().getName(),
-                        (System.currentTimeMillis() - deploymentReadyTimestamp) / 1000);
+                        (clock.millis() - deploymentReadyTimestamp) / 1000);
         emitCutoverEvent(context, EventRecorder.Type.Normal, "CutoverHeld", held);
 
         return UpdateControl.<FlinkBlueGreenDeployment>noUpdate().rescheduleAfter(reschedInterval);
@@ -890,7 +908,7 @@ public class BlueGreenDeploymentService {
     private UpdateControl<FlinkBlueGreenDeployment> waitBeforeDeleting(
             FlinkDeployment currentDeployment, long deletionTimestamp) {
 
-        long delay = deletionTimestamp - System.currentTimeMillis();
+        long delay = deletionTimestamp - clock.millis();
         LOG.info(
                 "Awaiting deletion delay for FlinkDeployment '{}', rescheduling reconciliation in {} seconds.",
                 currentDeployment.getMetadata().getName(),
@@ -929,7 +947,7 @@ public class BlueGreenDeploymentService {
             throw new IllegalStateException("Unexpected abortTimestamp == 0");
         }
 
-        if (abortTimestamp < System.currentTimeMillis()) {
+        if (abortTimestamp < clock.millis()) {
             return abortDeployment(context, nextDeployment, nextState, deploymentName);
         } else {
             return retryDeployment(context, deploymentName);

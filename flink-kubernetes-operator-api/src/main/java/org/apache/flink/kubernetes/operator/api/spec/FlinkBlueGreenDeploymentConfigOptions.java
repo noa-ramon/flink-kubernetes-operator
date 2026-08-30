@@ -91,8 +91,9 @@ public class FlinkBlueGreenDeploymentConfigOptions {
                     .defaultValue(Duration.ofHours(1))
                     .withDescription(
                             "The max time to wait for the new deployment to drain its source backlog when"
-                                    + " cutover.wait-for-source-drain is enabled, measured from the moment the new"
-                                    + " deployment became ready. If exceeded, the transition is aborted: the new"
+                                    + " cutover.wait-for-source-drain is enabled, measured from the moment the gate"
+                                    + " starts evaluating: when the new deployment became ready plus any"
+                                    + " deployment-deletion.delay. If exceeded, the transition is aborted: the new"
                                     + " deployment is suspended and the previous one remains active.");
 
     public static final ConfigOption<Duration> CUTOVER_DRAIN_CONFIRMATION_WINDOW =

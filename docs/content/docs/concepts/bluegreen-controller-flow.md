@@ -107,7 +107,8 @@ or one of its source vertices restarts, or the set of reporting sources changes 
 claim about observations, and any gap in them starts it over.
 
 `kubernetes.operator.bluegreen.cutover.drain-timeout` (default 1h) bounds the wait, measured from
-the moment the new deployment became ready. On expiry the transition is aborted: the new deployment
+the moment the gate starts evaluating - when the new deployment became ready, plus any
+`deployment-deletion.delay` - so the delay can never consume the drain budget. On expiry the transition is aborted: the new deployment
 is suspended, the previous one keeps serving, and the resource is marked FAILING. The deadline is
 evaluated before the drain check, so an expired hold always ends in an abort.
 
