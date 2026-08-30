@@ -715,8 +715,28 @@ public class BlueGreenDeploymentService {
                 settled,
                 heldFor / 1000,
                 Math.max(0, drainDeadline - System.currentTimeMillis()) / 1000,
-                notDrainedReason == null ? "CUTOVER" : (pastDeadline ? "ABORT" : "HOLD"),
+                pastDeadline ? "ABORT" : (notDrainedReason == null ? "CUTOVER" : "HOLD"),
                 notDrainedReason == null ? "" : " (" + notDrainedReason + ")");
+
+        // The deadline is evaluated before the backlog, so an expired hold can only ever end in an
+        // abort. Checking it second made the timeout advisory: a zero arriving at expiry won it,
+        // and a lost status update re-opened the gate for the next reconcile to promote on. A
+        // drain that finishes microseconds after the deadline is failed deliberately - a deadline
+        // that a late reading can overrule is not a deadline.
+        if (pastDeadline) {
+            String aborted =
+                    String.format(
+                            "FlinkDeployment '%s' did not drain its source backlog within the drain"
+                                    + " timeout (%s), aborting the transition and keeping '%s'.",
+                            nextDeploymentName,
+                            notDrainedReason == null
+                                    ? "the deadline expired as it reported a drained backlog"
+                                    : notDrainedReason,
+                            currentDeployment.getMetadata().getName());
+            LOG.error(aborted);
+            emitCutoverEvent(context, EventRecorder.Type.Warning, "CutoverAborted", aborted);
+            return abortDeployment(context, nextDeployment, nextState, nextDeploymentName);
+        }
 
         if (notDrainedReason == null) {
             String drained =
@@ -731,19 +751,6 @@ public class BlueGreenDeploymentService {
                             heldFor / 1000);
             emitCutoverEvent(context, EventRecorder.Type.Normal, "CutoverDrained", drained);
             return deleteDeployment(currentDeployment, context);
-        }
-
-        if (pastDeadline) {
-            String aborted =
-                    String.format(
-                            "FlinkDeployment '%s' did not drain its source backlog within the drain"
-                                    + " timeout (%s), aborting the transition and keeping '%s'.",
-                            nextDeploymentName,
-                            notDrainedReason,
-                            currentDeployment.getMetadata().getName());
-            LOG.error(aborted);
-            emitCutoverEvent(context, EventRecorder.Type.Warning, "CutoverAborted", aborted);
-            return abortDeployment(context, nextDeployment, nextState, nextDeploymentName);
         }
 
         String held =

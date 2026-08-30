@@ -2046,6 +2046,55 @@ public class FlinkBlueGreenDeploymentControllerTest {
                 "a later transition must not finalize on an inherited clock");
     }
 
+    /**
+     * An expired drain timeout must abort even if the backlog reads drained on the same evaluation.
+     * Checking the deadline after the backlog made the timeout advisory rather than binding: a zero
+     * arriving at expiry won, which is precisely the reading least worth trusting there, and a lost
+     * status update re-opened the gate for a later reconcile to promote on.
+     */
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyExpiredDeadlineAbortsEvenWhenTheBacklogReadsDrained(FlinkVersion flinkVersion)
+            throws Exception {
+        var blueGreenDeployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        flinkVersion,
+                        null,
+                        UpgradeMode.SAVEPOINT);
+
+        Map<String, String> configuration = blueGreenDeployment.getSpec().getConfiguration();
+        configuration.put(CUTOVER_WAIT_FOR_SOURCE_DRAIN.key(), "true");
+        // already expired by the time the first verdict is taken
+        configuration.put(CUTOVER_DRAIN_TIMEOUT.key(), "1");
+        configuration.put(DEPLOYMENT_DELETION_DELAY.key(), "0");
+        configuration.put(RECONCILIATION_RESCHEDULING_INTERVAL.key(), "100");
+        configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
+
+        var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+
+        // a drained backlog, settled - everything the cutover path wants
+        flinkService.setPendingRecords(0L);
+
+        simulateChangeInSpec(rs.deployment, UUID.randomUUID().toString(), 0, null);
+        rs = handleSavepoint(rs);
+        rs = reconcile(rs.deployment);
+        simulateSuccessfulJobStart(getFlinkDeployments().get(1));
+        rs = reconcile(rs.deployment);
+        Thread.sleep(300);
+        rs = reconcile(rs.deployment);
+
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_BLUE,
+                rs.reconciledStatus.getBlueGreenState(),
+                "an expired deadline must abort, not cut over on a zero read at expiry");
+        assertEquals(
+                2,
+                getFlinkDeployments().size(),
+                "the outgoing deployment must survive an expired deadline");
+    }
+
     /** A zero read on the very first check after readiness must not be enough to cut over. */
     @ParameterizedTest
     @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
