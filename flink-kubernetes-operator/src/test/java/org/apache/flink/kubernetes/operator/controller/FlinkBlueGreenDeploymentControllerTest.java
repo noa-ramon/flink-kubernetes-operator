@@ -2160,6 +2160,60 @@ public class FlinkBlueGreenDeploymentControllerTest {
                         + " idleness - the outgoing deployment must be kept");
     }
 
+    /** An unreadable metric is not a drained backlog: a REST failure must hold, never promote. */
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyUnreadableMetricHoldsTheCutover(FlinkVersion flinkVersion) throws Exception {
+        var blueGreenDeployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        flinkVersion,
+                        null,
+                        UpgradeMode.SAVEPOINT);
+
+        Map<String, String> configuration = blueGreenDeployment.getSpec().getConfiguration();
+        configuration.put(CUTOVER_WAIT_FOR_SOURCE_DRAIN.key(), "true");
+        configuration.put(CUTOVER_DRAIN_TIMEOUT.key(), "600000");
+        configuration.put(DEPLOYMENT_DELETION_DELAY.key(), "0");
+        configuration.put(RECONCILIATION_RESCHEDULING_INTERVAL.key(), "100");
+        configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
+
+        var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+
+        flinkService.setPendingRecordsThrows(true);
+
+        simulateChangeInSpec(rs.deployment, UUID.randomUUID().toString(), 0, null);
+        rs = handleSavepoint(rs);
+        rs = reconcile(rs.deployment);
+        simulateSuccessfulJobStart(getFlinkDeployments().get(1));
+        rs = reconcile(rs.deployment);
+        // well past the settle window: elapsed time alone must never turn a failure into a drain
+        Thread.sleep(300);
+        rs = reconcile(rs.deployment);
+        rs = reconcile(rs.deployment);
+
+        assertEquals(
+                2,
+                getFlinkDeployments().size(),
+                "a REST failure reading the backlog must hold the previous deployment");
+        assertEquals(
+                FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN,
+                rs.reconciledStatus.getBlueGreenState(),
+                "the transition must not finalize while the backlog cannot be read");
+
+        // and once the metric is readable again, the gate resumes normally
+        flinkService.setPendingRecordsThrows(false);
+        flinkService.setPendingRecords(0L);
+        Thread.sleep(300);
+        rs = reconcile(rs.deployment);
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_GREEN,
+                rs.reconciledStatus.getBlueGreenState(),
+                "recovering the metric must let the drained cutover proceed");
+    }
+
     /** A zero read on the very first check after readiness must not be enough to cut over. */
     @ParameterizedTest
     @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
