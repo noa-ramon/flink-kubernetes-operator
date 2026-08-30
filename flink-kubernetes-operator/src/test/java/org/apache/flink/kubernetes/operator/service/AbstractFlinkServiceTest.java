@@ -1752,6 +1752,148 @@ public class AbstractFlinkServiceTest {
                 "a finished source must not be queried at all");
     }
 
+    /**
+     * {@code timestamps[RUNNING]} is historical: it stays set while the job is RESTARTING, so a
+     * reading taken then would be tagged with the incarnation that no longer runs. The snapshot
+     * must come back unanchored, without querying any metrics at all.
+     */
+    @Test
+    public void getSourcePendingRecordsDiscardsReadingWhileJobIsRestarting() throws Exception {
+        var jobId = JobID.generate();
+        var vertex = new JobVertexID();
+        var metricRequests = new int[1];
+
+        var testingClusterClient = new TestingClusterClient<>(configuration, "test-cluster");
+        testingClusterClient.setRequestProcessor(
+                (headers, parameters, requestBody) -> {
+                    if (headers instanceof JobDetailsHeaders) {
+                        return CompletableFuture.completedFuture(
+                                buildJobDetailsInfo(
+                                        jobId,
+                                        List.of(vertex),
+                                        Set.of(),
+                                        false,
+                                        org.apache.flink.api.common.JobStatus.RESTARTING,
+                                        Map.of(),
+                                        TEST_VERTEX_START_TS));
+                    }
+                    metricRequests[0]++;
+                    return CompletableFuture.completedFuture(
+                            new AggregatedMetricsResponseBody(List.of()));
+                });
+
+        var snapshot =
+                new TestingService(testingClusterClient)
+                        .getSourcePendingRecords(configuration, jobId.toHexString());
+        assertEquals(
+                OptionalLong.empty(),
+                snapshot.getPendingRecords(),
+                "a restarting job has no observable backlog");
+        assertEquals(
+                0L,
+                snapshot.getJobRunningTimestamp(),
+                "a reading without a stably running job must carry no anchor");
+        assertEquals(0, metricRequests[0], "no metrics are queried for an unobservable job");
+    }
+
+    /**
+     * A regional restart can leave the job RUNNING while a source vertex is redeploying; a zero
+     * from that source's fresh gauge would be attributed to the execution that produced the
+     * backlog. Any unfinished source not in RUNNING must make the whole reading unobservable.
+     */
+    @Test
+    public void getSourcePendingRecordsDiscardsReadingWhileASourceIsNotRunning() throws Exception {
+        var jobId = JobID.generate();
+        var vertex = new JobVertexID();
+
+        var testingClusterClient = new TestingClusterClient<>(configuration, "test-cluster");
+        testingClusterClient.setRequestProcessor(
+                (headers, parameters, requestBody) -> {
+                    if (headers instanceof JobDetailsHeaders) {
+                        return CompletableFuture.completedFuture(
+                                buildJobDetailsInfo(
+                                        jobId,
+                                        List.of(vertex),
+                                        Set.of(),
+                                        false,
+                                        org.apache.flink.api.common.JobStatus.RUNNING,
+                                        Map.of(vertex, ExecutionState.DEPLOYING),
+                                        TEST_VERTEX_START_TS));
+                    }
+                    return CompletableFuture.completedFuture(
+                            new AggregatedMetricsResponseBody(List.of()));
+                });
+
+        var snapshot =
+                new TestingService(testingClusterClient)
+                        .getSourcePendingRecords(configuration, jobId.toHexString());
+        assertEquals(
+                OptionalLong.empty(),
+                snapshot.getPendingRecords(),
+                "a redeploying source makes the backlog unobservable");
+        assertEquals(
+                0L,
+                snapshot.getJobRunningTimestamp(),
+                "a reading with a non-running source must carry no anchor");
+    }
+
+    /**
+     * The anchors are sampled before the metric reads, so a source restarting in between would tag
+     * a zero from its fresh gauge with the old anchors - and that zero could complete an
+     * already-open confirmation window. A zero reading must therefore re-verify the anchors and be
+     * discarded when they moved.
+     */
+    @Test
+    public void getSourcePendingRecordsDiscardsZeroWhenAnchorsMoveDuringTheRead() throws Exception {
+        var jobId = JobID.generate();
+        var vertex = new JobVertexID();
+        var detailsCalls = new int[1];
+
+        var testingClusterClient = new TestingClusterClient<>(configuration, "test-cluster");
+        testingClusterClient.setRequestProcessor(
+                (headers, parameters, requestBody) -> {
+                    if (headers instanceof JobDetailsHeaders) {
+                        // the source restarts between the first read and the re-verification
+                        long startTime =
+                                ++detailsCalls[0] == 1
+                                        ? TEST_VERTEX_START_TS
+                                        : TEST_VERTEX_START_TS + 1000;
+                        return CompletableFuture.completedFuture(
+                                buildJobDetailsInfo(
+                                        jobId,
+                                        List.of(vertex),
+                                        Set.of(),
+                                        false,
+                                        org.apache.flink.api.common.JobStatus.RUNNING,
+                                        Map.of(),
+                                        startTime));
+                    }
+                    return CompletableFuture.completedFuture(
+                            new AggregatedMetricsResponseBody(
+                                    List.of(
+                                            new AggregatedMetric(
+                                                    "Source__MySource.pendingRecords",
+                                                    null,
+                                                    null,
+                                                    null,
+                                                    0.0,
+                                                    null))));
+                });
+
+        var snapshot =
+                new TestingService(testingClusterClient)
+                        .getSourcePendingRecords(configuration, jobId.toHexString());
+        assertEquals(2, detailsCalls[0], "a zero reading must re-verify the anchors");
+        assertEquals(
+                OptionalLong.empty(),
+                snapshot.getPendingRecords(),
+                "a zero straddling a source restart must be discarded, not reported as drained");
+        assertEquals(
+                0L,
+                snapshot.getJobRunningTimestamp(),
+                "a discarded reading must carry no anchor");
+    }
+
     private static String queriedVertexId(MessageParameters parameters) {
         return parameters.getPathParameters().stream()
                 .filter(p -> p instanceof JobVertexIdPathParameter)
@@ -1788,6 +1930,24 @@ public class AbstractFlinkServiceTest {
             List<JobVertexID> vertices,
             Set<JobVertexID> finished,
             boolean allSources) {
+        return buildJobDetailsInfo(
+                jobId,
+                vertices,
+                finished,
+                allSources,
+                org.apache.flink.api.common.JobStatus.RUNNING,
+                Map.of(),
+                TEST_VERTEX_START_TS);
+    }
+
+    private static JobDetailsInfo buildJobDetailsInfo(
+            JobID jobId,
+            List<JobVertexID> vertices,
+            Set<JobVertexID> finished,
+            boolean allSources,
+            org.apache.flink.api.common.JobStatus jobStatus,
+            Map<JobVertexID, ExecutionState> stateOverrides,
+            long vertexStartTs) {
         var vertexInfos = new ArrayList<JobDetailsInfo.JobVertexDetailsInfo>();
         for (var vertexId : vertices) {
             vertexInfos.add(
@@ -1797,10 +1957,12 @@ public class AbstractFlinkServiceTest {
                             vertexId.toString(),
                             1,
                             1,
-                            finished.contains(vertexId)
-                                    ? ExecutionState.FINISHED
-                                    : ExecutionState.RUNNING,
-                            TEST_VERTEX_START_TS,
+                            stateOverrides.getOrDefault(
+                                    vertexId,
+                                    finished.contains(vertexId)
+                                            ? ExecutionState.FINISHED
+                                            : ExecutionState.RUNNING),
+                            vertexStartTs,
                             0L,
                             0L,
                             Map.of(),
@@ -1811,7 +1973,7 @@ public class AbstractFlinkServiceTest {
                 jobId,
                 "test-job",
                 false,
-                org.apache.flink.api.common.JobStatus.RUNNING,
+                jobStatus,
                 0L,
                 0L,
                 0L,

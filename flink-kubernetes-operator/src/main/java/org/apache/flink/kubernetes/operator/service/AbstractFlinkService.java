@@ -58,6 +58,7 @@ import org.apache.flink.kubernetes.operator.utils.EventRecorder;
 import org.apache.flink.kubernetes.operator.utils.ExceptionUtils;
 import org.apache.flink.kubernetes.operator.utils.FlinkUtils;
 import org.apache.flink.runtime.client.JobStatusMessage;
+import org.apache.flink.runtime.execution.ExecutionState;
 import org.apache.flink.runtime.highavailability.nonha.standalone.StandaloneClientHAServices;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.jobmaster.JobResult;
@@ -87,6 +88,7 @@ import org.apache.flink.runtime.rest.messages.checkpoints.CheckpointTriggerReque
 import org.apache.flink.runtime.rest.messages.checkpoints.CheckpointingStatistics;
 import org.apache.flink.runtime.rest.messages.checkpoints.CheckpointingStatisticsHeaders;
 import org.apache.flink.runtime.rest.messages.job.JobDetailsHeaders;
+import org.apache.flink.runtime.rest.messages.job.JobDetailsInfo;
 import org.apache.flink.runtime.rest.messages.job.JobExceptionsMessageParameters;
 import org.apache.flink.runtime.rest.messages.job.metrics.AggregatedMetric;
 import org.apache.flink.runtime.rest.messages.job.metrics.AggregatedMetricsResponseBody;
@@ -149,6 +151,7 @@ import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -1100,18 +1103,7 @@ public abstract class AbstractFlinkService implements FlinkService {
             throws Exception {
         var flinkJobId = JobID.fromHexString(jobId);
         try (var clusterClient = getClusterClient(conf)) {
-            var detailsParameters = new JobMessageParameters();
-            detailsParameters.jobPathParameter.resolve(flinkJobId);
-            var jobDetails =
-                    clusterClient
-                            .sendRequest(
-                                    JobDetailsHeaders.getInstance(),
-                                    detailsParameters,
-                                    EmptyRequestBody.getInstance())
-                            .get(
-                                    operatorConfig.getFlinkClientTimeout().toSeconds(),
-                                    TimeUnit.SECONDS);
-
+            var jobDetails = fetchJobDetails(clusterClient, flinkJobId);
             var topology = JobTopology.fromJobDetails(jobDetails);
 
             // The same response carries the identity of this observation: when the current
@@ -1120,25 +1112,44 @@ public abstract class AbstractFlinkService implements FlinkService {
             // one from an execution that no longer exists.
             long jobRunningTimestamp =
                     jobDetails.getTimestamps().getOrDefault(JobStatus.RUNNING, 0L);
-            var vertexDetails = new HashMap<JobVertexID, Long>();
+            var vertexStartTimes = new HashMap<JobVertexID, Long>();
+            var vertexStates = new HashMap<JobVertexID, ExecutionState>();
             jobDetails
                     .getJobVertexInfos()
-                    .forEach(v -> vertexDetails.put(v.getJobVertexID(), v.getStartTime()));
+                    .forEach(
+                            v -> {
+                                vertexStartTimes.put(v.getJobVertexID(), v.getStartTime());
+                                vertexStates.put(v.getJobVertexID(), v.getExecutionState());
+                            });
 
-            long pendingRecords = 0;
-            int runningSources = 0;
+            var sourceVertices = new ArrayList<JobVertexID>();
             long sourcesEpoch = 0;
-            var reportingSources = new HashSet<JobVertexID>();
-
+            // A reading is only attributable while the job and all its unfinished sources are
+            // actually RUNNING: timestamps[RUNNING] is historical and survives into RESTARTING,
+            // and a regional restart can leave the job RUNNING while a source is not. Only
+            // sources matter here - a bounded source that already finished cannot hold a backlog,
+            // so it is excluded exactly as the autoscaler excludes finished vertices.
+            boolean observable = jobDetails.getJobStatus() == JobStatus.RUNNING;
             for (var vertexId : topology.getVertexInfos().keySet()) {
-                // Only sources carry a backlog, and a bounded source that already finished cannot
-                // hold one - the autoscaler reads finished vertices as zero for the same reason.
                 if (!topology.isSource(vertexId)
                         || topology.getFinishedVertices().contains(vertexId)) {
                     continue;
                 }
+                sourceVertices.add(vertexId);
+                sourcesEpoch = Math.max(sourcesEpoch, vertexStartTimes.getOrDefault(vertexId, 0L));
+                observable &= vertexStates.get(vertexId) == ExecutionState.RUNNING;
+            }
+            if (!observable) {
+                LOG.debug("Job {} is not stably RUNNING, backlog reading discarded", jobId);
+                return SourceBacklogSnapshot.unobservable();
+            }
+
+            long pendingRecords = 0;
+            int runningSources = 0;
+            var reportingSources = new HashSet<JobVertexID>();
+
+            for (var vertexId : sourceVertices) {
                 runningSources++;
-                sourcesEpoch = Math.max(sourcesEpoch, vertexDetails.getOrDefault(vertexId, 0L));
                 // The metric is exposed per operator, so its name carries the operator as a prefix
                 // (for example "Source__MySource.pendingRecords"). Ask the vertex which metrics it
                 // has before querying, exactly as the autoscaler does - a filter on the bare name
@@ -1174,6 +1185,41 @@ public abstract class AbstractFlinkService implements FlinkService {
                 }
             }
 
+            // The anchors were sampled before the metric reads. If a source restarted in
+            // between, a zero from its fresh gauge would be tagged with the old anchors and
+            // could complete an already-open confirmation window - the exact promotion this
+            // gate exists to prevent, and the only reading dangerous enough to re-verify.
+            // Re-read the job details and discard the observation unless the job is still
+            // RUNNING on the same anchors.
+            if (!reportingSources.isEmpty() && pendingRecords == 0) {
+                var recheck = fetchJobDetails(clusterClient, flinkJobId);
+                var recheckStartTimes = new HashMap<JobVertexID, Long>();
+                var recheckStates = new HashMap<JobVertexID, ExecutionState>();
+                recheck.getJobVertexInfos()
+                        .forEach(
+                                v -> {
+                                    recheckStartTimes.put(v.getJobVertexID(), v.getStartTime());
+                                    recheckStates.put(v.getJobVertexID(), v.getExecutionState());
+                                });
+                boolean unchanged =
+                        recheck.getJobStatus() == JobStatus.RUNNING
+                                && recheck.getTimestamps().getOrDefault(JobStatus.RUNNING, 0L)
+                                        == jobRunningTimestamp;
+                for (var vertexId : sourceVertices) {
+                    unchanged &=
+                            recheckStates.get(vertexId) == ExecutionState.RUNNING
+                                    && vertexStartTimes
+                                            .get(vertexId)
+                                            .equals(recheckStartTimes.get(vertexId));
+                }
+                if (!unchanged) {
+                    LOG.debug(
+                            "Job {} restarted while its backlog was read, zero reading discarded",
+                            jobId);
+                    return SourceBacklogSnapshot.unobservable();
+                }
+            }
+
             // No source reporting at all is not a drained job, it is a job whose backlog could
             // not be observed. That is what a query for the un-prefixed metric name used to look
             // like, and it let a cutover through while the backlog was still growing.
@@ -1184,6 +1230,18 @@ public abstract class AbstractFlinkService implements FlinkService {
             return new SourceBacklogSnapshot(
                     backlog, runningSources, reportingSources, jobRunningTimestamp, sourcesEpoch);
         }
+    }
+
+    private JobDetailsInfo fetchJobDetails(
+            RestClusterClient<String> clusterClient, JobID flinkJobId) throws Exception {
+        var detailsParameters = new JobMessageParameters();
+        detailsParameters.jobPathParameter.resolve(flinkJobId);
+        return clusterClient
+                .sendRequest(
+                        JobDetailsHeaders.getInstance(),
+                        detailsParameters,
+                        EmptyRequestBody.getInstance())
+                .get(operatorConfig.getFlinkClientTimeout().toSeconds(), TimeUnit.SECONDS);
     }
 
     private AggregatedMetricsResponseBody queryVertexMetrics(

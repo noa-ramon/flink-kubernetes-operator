@@ -161,6 +161,15 @@ public interface FlinkService {
         private final Set<JobVertexID> reportingSources;
         private final long jobRunningTimestamp;
         private final long sourcesEpoch;
+
+        /**
+         * A reading taken while the job was not stably RUNNING - during a restart, or when the
+         * anchors moved between the topology and metric reads. It carries no anchor, so the gate
+         * holds on it and restarts its confirmation window.
+         */
+        public static SourceBacklogSnapshot unobservable() {
+            return new SourceBacklogSnapshot(OptionalLong.empty(), 0, Set.of(), 0L, 0L);
+        }
     }
 
     Map<String, String> getMetrics(Configuration conf, String jobId, List<String> metricNames)
