@@ -718,6 +718,9 @@ public class BlueGreenDeploymentService {
                     nextDeploymentName,
                     e);
             notDrainedReason = "the pending records metric could not be read";
+            // The window claims the backlog read as CONTINUOUSLY empty; a gap in which it could
+            // not be read at all breaks that claim, so the window starts over once reads resume.
+            drainConfirmations.remove(confirmationKey(context));
         }
 
         // A single reading is never evidence of a drain: sources initialise pendingRecords lazily
@@ -743,6 +746,12 @@ public class BlueGreenDeploymentService {
                         String.format(
                                 "it has %d pending records",
                                 backlog.getPendingRecords().getAsLong());
+            } else if (backlog.getJobRunningTimestamp() == 0) {
+                // No RUNNING timestamp means the job details were taken while the job was not
+                // observably running (e.g. mid-restart) - a zero read then is a stale aggregate,
+                // not evidence, and it must not anchor or extend the window.
+                drainConfirmations.remove(confirmationKey);
+                notDrainedReason = "the job is not observably running";
             } else {
                 long now = System.currentTimeMillis();
                 DrainConfirmation previous = drainConfirmations.get(confirmationKey);

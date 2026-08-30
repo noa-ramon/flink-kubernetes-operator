@@ -2354,6 +2354,121 @@ public class FlinkBlueGreenDeploymentControllerTest {
                 "the transition after a reverted one must complete normally");
     }
 
+    /**
+     * The window claims the backlog read as continuously empty. A stretch in which the metric could
+     * not be read at all is a gap in that claim, so reads resuming after a failure must start the
+     * window over rather than complete it across the blind stretch.
+     */
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyUnreadableStretchRestartsTheWindow(FlinkVersion flinkVersion)
+            throws Exception {
+        var blueGreenDeployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        flinkVersion,
+                        null,
+                        UpgradeMode.SAVEPOINT);
+
+        Map<String, String> configuration = blueGreenDeployment.getSpec().getConfiguration();
+        configuration.put(CUTOVER_WAIT_FOR_SOURCE_DRAIN.key(), "true");
+        configuration.put(CUTOVER_DRAIN_TIMEOUT.key(), "600000");
+        configuration.put(CUTOVER_DRAIN_CONFIRMATION_WINDOW.key(), "300");
+        configuration.put(DEPLOYMENT_DELETION_DELAY.key(), "0");
+        configuration.put(RECONCILIATION_RESCHEDULING_INTERVAL.key(), "100");
+        configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
+
+        var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+
+        flinkService.setPendingRecords(0L);
+        simulateChangeInSpec(rs.deployment, UUID.randomUUID().toString(), 0, null);
+        rs = handleSavepoint(rs);
+        rs = reconcile(rs.deployment);
+        simulateSuccessfulJobStart(getFlinkDeployments().get(1));
+        rs = reconcile(rs.deployment);
+
+        // the window opens on a real zero, then the metric becomes unreadable across it
+        rs = reconcile(rs.deployment);
+        flinkService.setPendingRecordsThrows(true);
+        Thread.sleep(350);
+        rs = reconcile(rs.deployment);
+        assertEquals(2, getFlinkDeployments().size(), "an unreadable stretch must hold");
+
+        // reads resume: wall time alone spans the window, but the gap broke the claim
+        flinkService.setPendingRecordsThrows(false);
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                2,
+                getFlinkDeployments().size(),
+                "a zero following a blind gap must restart the window, not complete it");
+
+        Thread.sleep(350);
+        rs = reconcile(rs.deployment);
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_GREEN,
+                rs.reconciledStatus.getBlueGreenState(),
+                "a full gap-free window completes the drain");
+    }
+
+    /**
+     * A zero reading taken while the job has no RUNNING timestamp - job details fetched mid-restart
+     * - is a stale aggregate, not evidence: it must neither anchor nor extend the window.
+     */
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyZeroWithoutRunningTimestampDoesNotCount(FlinkVersion flinkVersion)
+            throws Exception {
+        var blueGreenDeployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        flinkVersion,
+                        null,
+                        UpgradeMode.SAVEPOINT);
+
+        Map<String, String> configuration = blueGreenDeployment.getSpec().getConfiguration();
+        configuration.put(CUTOVER_WAIT_FOR_SOURCE_DRAIN.key(), "true");
+        configuration.put(CUTOVER_DRAIN_TIMEOUT.key(), "600000");
+        configuration.put(CUTOVER_DRAIN_CONFIRMATION_WINDOW.key(), "300");
+        configuration.put(DEPLOYMENT_DELETION_DELAY.key(), "0");
+        configuration.put(RECONCILIATION_RESCHEDULING_INTERVAL.key(), "100");
+        configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
+
+        var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+
+        flinkService.setPendingRecords(0L);
+        flinkService.setJobRunningTimestamp(0L);
+        simulateChangeInSpec(rs.deployment, UUID.randomUUID().toString(), 0, null);
+        rs = handleSavepoint(rs);
+        rs = reconcile(rs.deployment);
+        simulateSuccessfulJobStart(getFlinkDeployments().get(1));
+        rs = reconcile(rs.deployment);
+
+        // zeros with no RUNNING timestamp, spanning far more wall time than the window
+        rs = reconcile(rs.deployment);
+        Thread.sleep(350);
+        rs = reconcile(rs.deployment);
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                2,
+                getFlinkDeployments().size(),
+                "zeros from a job that is not observably running must never complete the window");
+
+        // the job becomes observably running: a fresh gap-free window is still required
+        flinkService.setJobRunningTimestamp(7L);
+        rs = reconcile(rs.deployment);
+        assertEquals(2, getFlinkDeployments().size(), "the first countable zero only opens it");
+        Thread.sleep(350);
+        rs = reconcile(rs.deployment);
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_GREEN,
+                rs.reconciledStatus.getBlueGreenState(),
+                "a full window of countable zeros completes the drain");
+    }
+
     /** A zero read on the very first check after readiness must not be enough to cut over. */
     @ParameterizedTest
     @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
