@@ -152,6 +152,7 @@ import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -1095,7 +1096,8 @@ public abstract class AbstractFlinkService implements FlinkService {
     }
 
     @Override
-    public OptionalLong getSourcePendingRecords(Configuration conf, String jobId) throws Exception {
+    public SourceBacklogSnapshot getSourcePendingRecords(Configuration conf, String jobId)
+            throws Exception {
         var flinkJobId = JobID.fromHexString(jobId);
         try (var clusterClient = getClusterClient(conf)) {
             var detailsParameters = new JobMessageParameters();
@@ -1112,8 +1114,21 @@ public abstract class AbstractFlinkService implements FlinkService {
 
             var topology = JobTopology.fromJobDetails(jobDetails);
 
+            // The same response carries the identity of this observation: when the current
+            // incarnation of the job entered RUNNING, and when each vertex's current execution
+            // started. Both move forward on a restart, so a reading can never be mistaken for
+            // one from an execution that no longer exists.
+            long jobRunningTimestamp =
+                    jobDetails.getTimestamps().getOrDefault(JobStatus.RUNNING, 0L);
+            var vertexDetails = new HashMap<JobVertexID, Long>();
+            jobDetails
+                    .getJobVertexInfos()
+                    .forEach(v -> vertexDetails.put(v.getJobVertexID(), v.getStartTime()));
+
             long pendingRecords = 0;
-            int sourcesReporting = 0;
+            int runningSources = 0;
+            long sourcesEpoch = 0;
+            var reportingSources = new HashSet<JobVertexID>();
 
             for (var vertexId : topology.getVertexInfos().keySet()) {
                 // Only sources carry a backlog, and a bounded source that already finished cannot
@@ -1122,6 +1137,8 @@ public abstract class AbstractFlinkService implements FlinkService {
                         || topology.getFinishedVertices().contains(vertexId)) {
                     continue;
                 }
+                runningSources++;
+                sourcesEpoch = Math.max(sourcesEpoch, vertexDetails.getOrDefault(vertexId, 0L));
                 // The metric is exposed per operator, so its name carries the operator as a prefix
                 // (for example "Source__MySource.pendingRecords"). Ask the vertex which metrics it
                 // has before querying, exactly as the autoscaler does - a filter on the bare name
@@ -1147,7 +1164,7 @@ public abstract class AbstractFlinkService implements FlinkService {
                                 .getMetrics()) {
                     if (metric.getSum() != null) {
                         pendingRecords += metric.getSum().longValue();
-                        sourcesReporting++;
+                        reportingSources.add(vertexId);
                         LOG.debug(
                                 "Source {} reports {}={}",
                                 vertexId,
@@ -1157,13 +1174,15 @@ public abstract class AbstractFlinkService implements FlinkService {
                 }
             }
 
-            // No source reporting at all is not a drained job, it is a job we failed to read. That
-            // is what a query for the un-prefixed metric name used to look like, and it let a
-            // cutover through while the backlog was still growing.
-            if (sourcesReporting == 0) {
-                return OptionalLong.empty();
-            }
-            return OptionalLong.of(pendingRecords);
+            // No source reporting at all is not a drained job, it is a job whose backlog could
+            // not be observed. That is what a query for the un-prefixed metric name used to look
+            // like, and it let a cutover through while the backlog was still growing.
+            var backlog =
+                    reportingSources.isEmpty()
+                            ? OptionalLong.empty()
+                            : OptionalLong.of(pendingRecords);
+            return new SourceBacklogSnapshot(
+                    backlog, runningSources, reportingSources, jobRunningTimestamp, sourcesEpoch);
         }
     }
 

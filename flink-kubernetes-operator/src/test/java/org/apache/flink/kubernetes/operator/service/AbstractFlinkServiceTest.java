@@ -1590,10 +1590,19 @@ public class AbstractFlinkServiceTest {
 
         var flinkService = new TestingService(testingClusterClient);
 
+        var snapshot = flinkService.getSourcePendingRecords(configuration, jobId.toHexString());
         assertEquals(
                 OptionalLong.of(1234L),
-                flinkService.getSourcePendingRecords(configuration, jobId.toHexString()),
+                snapshot.getPendingRecords(),
                 "the source vertex backlog must be returned, non-reporting vertices adding zero");
+        assertEquals(
+                Set.of(sourceVertex),
+                snapshot.getReportingSources(),
+                "the snapshot must identify which sources produced the reading");
+        assertEquals(
+                TEST_RUNNING_TS,
+                snapshot.getJobRunningTimestamp(),
+                "the snapshot must carry the incarnation that produced the reading");
         assertEquals(
                 2,
                 queriedVertices.size(),
@@ -1634,7 +1643,9 @@ public class AbstractFlinkServiceTest {
 
         assertEquals(
                 OptionalLong.empty(),
-                flinkService.getSourcePendingRecords(configuration, jobId.toHexString()),
+                flinkService
+                        .getSourcePendingRecords(configuration, jobId.toHexString())
+                        .getPendingRecords(),
                 "a job whose operators do not expose pendingRecords must report unknown");
     }
 
@@ -1677,10 +1688,19 @@ public class AbstractFlinkServiceTest {
 
         var flinkService = new TestingService(testingClusterClient);
 
+        var snapshot = flinkService.getSourcePendingRecords(configuration, jobId.toHexString());
         assertEquals(
                 OptionalLong.of(0L),
-                flinkService.getSourcePendingRecords(configuration, jobId.toHexString()),
+                snapshot.getPendingRecords(),
                 "the reporting source is drained and the silent source has no backlog to add");
+        assertEquals(
+                1,
+                snapshot.getReportingSources().size(),
+                "only the reporting source may appear in the reporting set");
+        assertEquals(
+                2,
+                snapshot.getRunningSources(),
+                "the silent source still counts as running, so partial coverage is visible");
     }
 
     /**
@@ -1720,10 +1740,13 @@ public class AbstractFlinkServiceTest {
 
         var flinkService = new TestingService(testingClusterClient);
 
+        var snapshot = flinkService.getSourcePendingRecords(configuration, jobId.toHexString());
         assertEquals(
                 OptionalLong.of(0L),
-                flinkService.getSourcePendingRecords(configuration, jobId.toHexString()),
+                snapshot.getPendingRecords(),
                 "the drained running source must be reported, the finished source ignored");
+        assertEquals(
+                1, snapshot.getRunningSources(), "a finished source must not count as running");
         assertTrue(
                 queriedVertices.stream().noneMatch(v -> v.equals(finishedSource.toString())),
                 "a finished source must not be queried at all");
@@ -1742,6 +1765,9 @@ public class AbstractFlinkServiceTest {
             JobID jobId, List<JobVertexID> sources, Set<JobVertexID> finished) {
         return buildJobDetailsInfo(jobId, sources, finished, true);
     }
+
+    private static final long TEST_RUNNING_TS = 1_700_000_000_000L;
+    private static final long TEST_VERTEX_START_TS = 1_700_000_000_500L;
 
     private static JobDetailsInfo buildJobDetailsInfo(JobID jobId, List<JobVertexID> vertices) {
         return buildJobDetailsInfo(jobId, vertices, Set.of());
@@ -1774,7 +1800,7 @@ public class AbstractFlinkServiceTest {
                             finished.contains(vertexId)
                                     ? ExecutionState.FINISHED
                                     : ExecutionState.RUNNING,
-                            0L,
+                            TEST_VERTEX_START_TS,
                             0L,
                             0L,
                             Map.of(),
@@ -1791,7 +1817,7 @@ public class AbstractFlinkServiceTest {
                 0L,
                 0L,
                 0L,
-                Map.of(),
+                Map.of(org.apache.flink.api.common.JobStatus.RUNNING, TEST_RUNNING_TS),
                 vertexInfos,
                 Map.of(),
                 new JobPlanInfo.RawJson(buildJsonPlan(vertices, allSources)));

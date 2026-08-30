@@ -52,7 +52,6 @@ import io.javaoperatorsdk.operator.api.reconciler.Context;
 import io.javaoperatorsdk.operator.api.reconciler.UpdateControl;
 import org.jetbrains.annotations.NotNull;
 import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
@@ -68,6 +67,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import static org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentConfigOptions.ABORT_GRACE_PERIOD;
+import static org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentConfigOptions.CUTOVER_DRAIN_CONFIRMATION_WINDOW;
 import static org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentConfigOptions.CUTOVER_DRAIN_TIMEOUT;
 import static org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentConfigOptions.CUTOVER_WAIT_FOR_SOURCE_DRAIN;
 import static org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentConfigOptions.DEPLOYMENT_DELETION_DELAY;
@@ -1711,6 +1711,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         Map<String, String> configuration = blueGreenDeployment.getSpec().getConfiguration();
         configuration.put(CUTOVER_WAIT_FOR_SOURCE_DRAIN.key(), "true");
         configuration.put(CUTOVER_DRAIN_TIMEOUT.key(), "60000");
+        configuration.put(CUTOVER_DRAIN_CONFIRMATION_WINDOW.key(), "300");
         configuration.put(DEPLOYMENT_DELETION_DELAY.key(), "0");
         configuration.put(RECONCILIATION_RESCHEDULING_INTERVAL.key(), "100");
         configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
@@ -1741,13 +1742,20 @@ public class FlinkBlueGreenDeploymentControllerTest {
                 rs.reconciledStatus.getBlueGreenState(),
                 "the transition must not finalize before the backlog is drained");
 
-        // Drain check #2: 0 pending, and past the settle window -> cutover proceeds
-        Thread.sleep(300);
+        // Drain check #2: the first zero reading starts the confirmation window - it must hold
+        rs = reconcile(rs.deployment);
+        assertEquals(2, getFlinkDeployments().size(), "one zero reading must not cut over");
+        // Drain check #3: still inside the window
+        rs = reconcile(rs.deployment);
+        assertEquals(2, getFlinkDeployments().size(), "a zero inside the window must not cut over");
+        // Drain check #4: the backlog has read empty across the whole window
+        Thread.sleep(350);
         rs = reconcile(rs.deployment);
         assertEquals(
                 1,
                 getFlinkDeployments().size(),
-                "the previous deployment must be deleted once the backlog is drained");
+                "the previous deployment must be deleted once the backlog has read empty across"
+                        + " the confirmation window");
         // On this release line the delete call does not finalize; the next reconcile does
         rs = reconcile(rs.deployment);
         assertEquals(
@@ -1876,7 +1884,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
      */
     @ParameterizedTest
     @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
-    public void verifyUnreportedPendingRecordsHoldsUntilIdleIsConfirmed(FlinkVersion flinkVersion)
+    public void verifyUnreportedPendingRecordsAlwaysHold(FlinkVersion flinkVersion)
             throws Exception {
         var blueGreenDeployment =
                 buildSessionCluster(
@@ -1911,7 +1919,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         assertEquals(
                 2,
                 getFlinkDeployments().size(),
-                "an unreported metric must not be read as idle inside the settle window");
+                "an unreported metric must always hold - silence is never evidence of a drain");
         assertEquals(
                 FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN,
                 rs.reconciledStatus.getBlueGreenState(),
@@ -1919,14 +1927,14 @@ public class FlinkBlueGreenDeploymentControllerTest {
     }
 
     /**
-     * A source reading an idle topic never exposes pendingRecords at all, so silence that persists
-     * past the settle window must be read as an empty backlog - otherwise a job with any
-     * permanently idle source could never cut over and every transition would end in an abort.
+     * A job whose sources never expose pendingRecords cannot prove its backlog is drained, and
+     * silence is not evidence: FLIP-33 marks the metric optional and a restart wipes the gauge, so
+     * absence is indistinguishable from metric loss over a real backlog. Such a transition fails
+     * closed at the drain timeout - the previous deployment keeps running.
      */
     @ParameterizedTest
     @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
-    public void verifyUnreportedPendingRecordsCutsOverOnceIdleIsConfirmed(FlinkVersion flinkVersion)
-            throws Exception {
+    public void verifyAllSilentJobAbortsAtDrainTimeout(FlinkVersion flinkVersion) throws Exception {
         var blueGreenDeployment =
                 buildSessionCluster(
                         TEST_DEPLOYMENT_NAME,
@@ -1937,7 +1945,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
 
         Map<String, String> configuration = blueGreenDeployment.getSpec().getConfiguration();
         configuration.put(CUTOVER_WAIT_FOR_SOURCE_DRAIN.key(), "true");
-        configuration.put(CUTOVER_DRAIN_TIMEOUT.key(), "60000");
+        configuration.put(CUTOVER_DRAIN_TIMEOUT.key(), "200");
         configuration.put(DEPLOYMENT_DELETION_DELAY.key(), "0");
         configuration.put(RECONCILIATION_RESCHEDULING_INTERVAL.key(), "100");
         configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
@@ -1950,25 +1958,25 @@ public class FlinkBlueGreenDeploymentControllerTest {
         rs = handleSavepoint(rs);
         rs = reconcile(rs.deployment);
         simulateSuccessfulJobStart(getFlinkDeployments().get(1));
-        // marks the new deployment ready, then holds while still inside the settle window
         rs = reconcile(rs.deployment);
-        rs = reconcile(rs.deployment);
+
+        var abortRef = new AtomicReference<>(rs);
+        await().atMost(10, TimeUnit.SECONDS)
+                .pollInterval(100, TimeUnit.MILLISECONDS)
+                .untilAsserted(
+                        () -> {
+                            abortRef.set(reconcile(abortRef.get().deployment));
+                            assertEquals(
+                                    FlinkBlueGreenDeploymentState.ACTIVE_BLUE,
+                                    abortRef.get().reconciledStatus.getBlueGreenState());
+                        });
+        rs = abortRef.get();
+
+        assertFailingJobStatus(rs);
         assertEquals(
                 2,
                 getFlinkDeployments().size(),
-                "the previous deployment must be kept until the silence is confirmed");
-
-        // past the settle window the continued silence is read as an idle source
-        Thread.sleep(300);
-        rs = reconcile(rs.deployment);
-        assertEquals(
-                1,
-                getFlinkDeployments().size(),
-                "a source that never exposes the metric must not block the cutover forever");
-        rs = reconcile(rs.deployment);
-        assertEquals(
-                FlinkBlueGreenDeploymentState.ACTIVE_GREEN,
-                rs.reconciledStatus.getBlueGreenState());
+                "silence must never promote: the previous deployment survives the abort");
     }
 
     /**
@@ -2110,10 +2118,6 @@ public class FlinkBlueGreenDeploymentControllerTest {
      * evidence of idleness only when there is no contrary observation - here there is one, and it
      * is the last numeric value the gate ever saw.
      */
-    @Disabled(
-            "Red by design: proves the read-as-idle rung promotes on metric loss (deletes the"
-                    + " outgoing with 43,471 last observed and no zero ever seen). Enable with the"
-                    + " observation-based settle fix (CLDS-22666 bug 2).")
     @ParameterizedTest
     @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
     public void verifySilenceAfterAnObservedBacklogMustNotCutOver(FlinkVersion flinkVersion)
@@ -2175,6 +2179,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         Map<String, String> configuration = blueGreenDeployment.getSpec().getConfiguration();
         configuration.put(CUTOVER_WAIT_FOR_SOURCE_DRAIN.key(), "true");
         configuration.put(CUTOVER_DRAIN_TIMEOUT.key(), "600000");
+        configuration.put(CUTOVER_DRAIN_CONFIRMATION_WINDOW.key(), "300");
         configuration.put(DEPLOYMENT_DELETION_DELAY.key(), "0");
         configuration.put(RECONCILIATION_RESCHEDULING_INTERVAL.key(), "100");
         configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
@@ -2202,16 +2207,75 @@ public class FlinkBlueGreenDeploymentControllerTest {
                 rs.reconciledStatus.getBlueGreenState(),
                 "the transition must not finalize while the backlog cannot be read");
 
-        // and once the metric is readable again, the gate resumes normally
+        // and once the metric is readable again, the gate resumes normally: a zero starts the
+        // confirmation window, and the cutover proceeds once the window has passed
         flinkService.setPendingRecordsThrows(false);
         flinkService.setPendingRecords(0L);
-        Thread.sleep(300);
+        rs = reconcile(rs.deployment);
+        Thread.sleep(350);
         rs = reconcile(rs.deployment);
         rs = reconcile(rs.deployment);
         assertEquals(
                 FlinkBlueGreenDeploymentState.ACTIVE_GREEN,
                 rs.reconciledStatus.getBlueGreenState(),
                 "recovering the metric must let the drained cutover proceed");
+    }
+
+    /**
+     * The confirmation window is anchored to the job incarnation that produced its readings. A
+     * restart wipes the lazily-created gauge and replays state, so readings taken before it say
+     * nothing about the job now running - the window starts over and must pass again.
+     */
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyJobRestartResetsTheConfirmationWindow(FlinkVersion flinkVersion)
+            throws Exception {
+        var blueGreenDeployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        flinkVersion,
+                        null,
+                        UpgradeMode.SAVEPOINT);
+
+        Map<String, String> configuration = blueGreenDeployment.getSpec().getConfiguration();
+        configuration.put(CUTOVER_WAIT_FOR_SOURCE_DRAIN.key(), "true");
+        configuration.put(CUTOVER_DRAIN_TIMEOUT.key(), "600000");
+        configuration.put(CUTOVER_DRAIN_CONFIRMATION_WINDOW.key(), "300");
+        configuration.put(DEPLOYMENT_DELETION_DELAY.key(), "0");
+        configuration.put(RECONCILIATION_RESCHEDULING_INTERVAL.key(), "100");
+        configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
+
+        var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+
+        flinkService.setPendingRecords(0L);
+
+        simulateChangeInSpec(rs.deployment, UUID.randomUUID().toString(), 0, null);
+        rs = handleSavepoint(rs);
+        rs = reconcile(rs.deployment);
+        simulateSuccessfulJobStart(getFlinkDeployments().get(1));
+        rs = reconcile(rs.deployment);
+
+        // the first zero starts the window, and most of it passes...
+        rs = reconcile(rs.deployment);
+        assertEquals(2, getFlinkDeployments().size(), "the window has only just started");
+        Thread.sleep(350);
+
+        // ...then the incoming job restarts: the readings the window was built on came from a
+        // gauge that no longer exists
+        flinkService.bumpJobIncarnation();
+
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                2,
+                getFlinkDeployments().size(),
+                "a reading from a new incarnation must restart the window, not complete it");
+        Thread.sleep(350);
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                1,
+                getFlinkDeployments().size(),
+                "a full window of readings from the same incarnation completes the drain");
     }
 
     /** A zero read on the very first check after readiness must not be enough to cut over. */

@@ -73,6 +73,7 @@ Converting an existing FlinkDeployment to use Blue/Green deployments requires mi
      kubernetes.operator.bluegreen.deployment-deletion.delay: "0ms"
      kubernetes.operator.bluegreen.cutover.wait-for-source-drain: "true"
      kubernetes.operator.bluegreen.cutover.drain-timeout: "30 min"
+     kubernetes.operator.bluegreen.cutover.drain-confirmation-window: "30 s"
    ```
    These settings control the abort grace period for failed deployments (default: 10 minutes), the reconciliation rescheduling interval (default: 15 seconds), and the delay before deleting old deployments after successful transitions (default: 0ms).
 
@@ -96,8 +97,13 @@ caught up: a deployment restored from the transition savepoint still replays the
 during its own startup, and for event-time pipelines with bounded allowed lateness those records
 reach the sink late. Setting `kubernetes.operator.bluegreen.cutover.wait-for-source-drain: "true"`
 keeps the previous deployment running until the new deployment's source backlog (`pendingRecords`,
-summed over its running sources) has drained to zero and the reading has been observed past a
-settle window.
+summed over its running sources) has read as continuously empty for
+`kubernetes.operator.bluegreen.cutover.drain-confirmation-window` (default 30 s). The window is
+measured from the first zero reading of the current incarnation of the job - never from wall time
+alone: a single reading is not evidence, since sources initialize `pendingRecords` lazily and a
+restart wipes the gauge. The window restarts whenever a non-zero backlog is read, no source
+reports the metric, the job or one of its source vertices restarts, or the set of reporting
+sources changes.
 
 `kubernetes.operator.bluegreen.cutover.drain-timeout` (default 1h) bounds the wait, measured from
 the moment the new deployment became ready. On expiry the transition is aborted: the new deployment
@@ -105,7 +111,7 @@ is suspended, the previous one keeps serving, and the resource is marked FAILING
 evaluated before the drain check, so an expired hold always ends in an abort.
 
 Every evaluation is logged
-(`Cutover gate for '<name>': pendingRecords=..., settled=..., heldFor=..., drainTimeoutIn=..., verdict=...`)
+(`Cutover gate for '<name>': pendingRecords=..., sources=..., zeroFor=..., heldFor=..., drainTimeoutIn=..., verdict=...`)
 and mirrored as `CutoverHeld` / `CutoverDrained` / `CutoverAborted` events on the resource. Both
 options live in `spec.configuration`, which is not part of the transition spec diff: they can be
 retuned while a transition is in flight and never trigger one.
@@ -114,7 +120,9 @@ Note that a drained backlog proves offset parity with the topic head, not data c
 backlog outlives the source topic's retention, records are removed by retention and the count falls
 identically to a drain. Sources also initialize `pendingRecords` lazily (FLIP-33 marks it
 optional), so a source that reports nothing contributes nothing; if no source reports at all, the
-backlog is treated as unknown and the gate holds.
+backlog is treated as unknown and the gate holds. A job whose sources never report therefore
+cannot complete a gated transition - it fails closed at the drain timeout with the previous
+deployment kept.
 
 ## Blue/Green State Machine
 

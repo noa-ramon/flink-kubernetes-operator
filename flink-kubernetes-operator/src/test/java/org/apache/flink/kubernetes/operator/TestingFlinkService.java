@@ -55,6 +55,7 @@ import org.apache.flink.runtime.client.DuplicateJobSubmissionException;
 import org.apache.flink.runtime.client.JobStatusMessage;
 import org.apache.flink.runtime.clusterframework.ApplicationStatus;
 import org.apache.flink.runtime.execution.ExecutionState;
+import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.jobgraph.SavepointConfigOptions;
 import org.apache.flink.runtime.jobmanager.HighAvailabilityMode;
 import org.apache.flink.runtime.jobmaster.JobResult;
@@ -766,8 +767,23 @@ public class TestingFlinkService extends AbstractFlinkService {
 
     @Setter private boolean pendingRecordsThrows = false;
 
+    /** A stable source identity, so consecutive readings anchor to the same reporting set. */
+    private static final JobVertexID TESTING_SOURCE_VERTEX = new JobVertexID();
+
+    @Setter private long jobRunningTimestamp = 1L;
+    @Setter private long sourcesEpoch = 1L;
+    @Setter private int runningSources = 1;
+    @Setter private Set<JobVertexID> reportingSources = Set.of(TESTING_SOURCE_VERTEX);
+
+    /** Simulates a job (or source) restart: the next reading belongs to a new incarnation. */
+    public void bumpJobIncarnation() {
+        jobRunningTimestamp++;
+        sourcesEpoch++;
+    }
+
     @Override
-    public OptionalLong getSourcePendingRecords(Configuration conf, String jobId) throws Exception {
+    public SourceBacklogSnapshot getSourcePendingRecords(Configuration conf, String jobId)
+            throws Exception {
         if (pendingRecordsThrows) {
             throw new Exception("Testing pending records failure");
         }
@@ -776,10 +792,16 @@ public class TestingFlinkService extends AbstractFlinkService {
                 pendingRecordsQueue.size() > 1
                         ? pendingRecordsQueue.poll()
                         : pendingRecordsQueue.peek();
-        if (next == null) {
-            return OptionalLong.of(0L);
-        }
-        return next.map(OptionalLong::of).orElseGet(OptionalLong::empty);
+        var value =
+                next == null
+                        ? OptionalLong.of(0L)
+                        : next.map(OptionalLong::of).orElseGet(OptionalLong::empty);
+        return new SourceBacklogSnapshot(
+                value,
+                runningSources,
+                value.isPresent() ? reportingSources : Set.of(),
+                jobRunningTimestamp,
+                sourcesEpoch);
     }
 
     /** Scripts "no source reports the metric" for the next check(s). */

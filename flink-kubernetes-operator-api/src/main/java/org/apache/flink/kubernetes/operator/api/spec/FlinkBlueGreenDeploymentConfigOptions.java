@@ -93,4 +93,18 @@ public class FlinkBlueGreenDeploymentConfigOptions {
                                     + " cutover.wait-for-source-drain is enabled, measured from the moment the new"
                                     + " deployment became ready. If exceeded, the transition is aborted: the new"
                                     + " deployment is suspended and the previous one remains active.");
+
+    public static final ConfigOption<Duration> CUTOVER_DRAIN_CONFIRMATION_WINDOW =
+            operatorConfig("cutover.drain-confirmation-window")
+                    .durationType()
+                    .defaultValue(Duration.ofSeconds(30))
+                    .withDescription(
+                            "How long the new deployment's backlog must be read as continuously empty before the"
+                                    + " cutover proceeds when cutover.wait-for-source-drain is enabled. The window is"
+                                    + " measured from the first zero reading of the current incarnation of the job -"
+                                    + " never from wall time alone: a single reading is not evidence, since sources"
+                                    + " initialise pendingRecords lazily and a restart wipes the gauge. The window"
+                                    + " restarts whenever a non-zero backlog is read, no source reports the metric,"
+                                    + " the job or one of its source vertices restarts, or the set of reporting"
+                                    + " sources changes.");
 }

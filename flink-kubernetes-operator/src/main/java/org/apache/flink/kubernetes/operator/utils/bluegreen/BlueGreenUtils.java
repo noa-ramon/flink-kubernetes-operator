@@ -48,6 +48,7 @@ import java.util.Map;
 import java.util.Optional;
 
 import static org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentConfigOptions.ABORT_GRACE_PERIOD;
+import static org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentConfigOptions.CUTOVER_DRAIN_CONFIRMATION_WINDOW;
 import static org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentConfigOptions.CUTOVER_DRAIN_TIMEOUT;
 import static org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentConfigOptions.CUTOVER_WAIT_FOR_SOURCE_DRAIN;
 import static org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentConfigOptions.DEPLOYMENT_DELETION_DELAY;
@@ -194,6 +195,19 @@ public class BlueGreenUtils {
     public static long getCutoverDrainTimeout(BlueGreenContext context) {
         return Math.max(
                 getConfigOption(context.getBgDeployment(), CUTOVER_DRAIN_TIMEOUT).toMillis(), 0);
+    }
+
+    /**
+     * Gets how long the backlog must be read as continuously empty before a gated cutover.
+     *
+     * @param context the Blue/Green transition context
+     * @return the confirmation window in milliseconds
+     */
+    public static long getCutoverDrainConfirmationWindow(BlueGreenContext context) {
+        return Math.max(
+                getConfigOption(context.getBgDeployment(), CUTOVER_DRAIN_CONFIRMATION_WINDOW)
+                        .toMillis(),
+                0);
     }
 
     /**
