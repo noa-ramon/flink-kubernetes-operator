@@ -52,6 +52,7 @@ import io.javaoperatorsdk.operator.api.reconciler.Context;
 import io.javaoperatorsdk.operator.api.reconciler.UpdateControl;
 import org.jetbrains.annotations.NotNull;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
@@ -2093,6 +2094,70 @@ public class FlinkBlueGreenDeploymentControllerTest {
                 2,
                 getFlinkDeployments().size(),
                 "the outgoing deployment must survive an expired deadline");
+    }
+
+    /**
+     * The read-as-idle rung exists for sources that never initialise the metric because their topic
+     * is idle - without it, such a job could never cut over at all. This test constructs the case
+     * where the same inference is provably wrong: the gate has already observed a large backlog,
+     * then the metric disappears (a TaskManager restart wipes the gauge, which is only re-created
+     * lazily on the next record). The job is not idle - the gate has first-hand evidence of 43,471
+     * pending records and has never once observed a zero - yet the silence plus elapsed wall time
+     * satisfies the clock-based settle and promotes, deleting the only deployment that was still
+     * covering the backlog.
+     *
+     * <p>Idleness is a claim about the job; the settle window only measures the clock. Silence is
+     * evidence of idleness only when there is no contrary observation - here there is one, and it
+     * is the last numeric value the gate ever saw.
+     */
+    @Disabled(
+            "Red by design: proves the read-as-idle rung promotes on metric loss (deletes the"
+                    + " outgoing with 43,471 last observed and no zero ever seen). Enable with the"
+                    + " observation-based settle fix (CLDS-22666 bug 2).")
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifySilenceAfterAnObservedBacklogMustNotCutOver(FlinkVersion flinkVersion)
+            throws Exception {
+        var blueGreenDeployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        flinkVersion,
+                        null,
+                        UpgradeMode.SAVEPOINT);
+
+        Map<String, String> configuration = blueGreenDeployment.getSpec().getConfiguration();
+        configuration.put(CUTOVER_WAIT_FOR_SOURCE_DRAIN.key(), "true");
+        configuration.put(CUTOVER_DRAIN_TIMEOUT.key(), "600000");
+        configuration.put(DEPLOYMENT_DELETION_DELAY.key(), "0");
+        configuration.put(RECONCILIATION_RESCHEDULING_INTERVAL.key(), "100");
+        configuration.put(ABORT_GRACE_PERIOD.key(), "60000");
+
+        var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+
+        // The incoming job reports a large real backlog on the first evaluation...
+        flinkService.setPendingRecords(43471L);
+
+        simulateChangeInSpec(rs.deployment, UUID.randomUUID().toString(), 0, null);
+        rs = handleSavepoint(rs);
+        rs = reconcile(rs.deployment);
+        simulateSuccessfulJobStart(getFlinkDeployments().get(1));
+        rs = reconcile(rs.deployment);
+        rs = reconcile(rs.deployment);
+        assertEquals(2, getFlinkDeployments().size(), "the observed backlog must hold the cutover");
+
+        // ...then its TaskManagers restart: the gauge is wiped and, being lazily initialised,
+        // stays absent until the next record is read. No zero has ever been observed.
+        flinkService.setPendingRecordsUnreported();
+        Thread.sleep(300); // wall time alone satisfies the clock-based settle window
+
+        rs = reconcile(rs.deployment);
+
+        assertEquals(
+                2,
+                getFlinkDeployments().size(),
+                "silence directly after an observed backlog of 43,471 is metric loss, not"
+                        + " idleness - the outgoing deployment must be kept");
     }
 
     /** A zero read on the very first check after readiness must not be enough to cut over. */
