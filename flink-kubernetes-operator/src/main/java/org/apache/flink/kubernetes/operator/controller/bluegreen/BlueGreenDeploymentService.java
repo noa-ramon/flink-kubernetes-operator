@@ -905,9 +905,11 @@ public class BlueGreenDeploymentService {
         boolean deleted = deleteFlinkDeployment(currentDeployment, context);
 
         if (!deleted) {
-            LOG.info("FlinkDeployment '{}' not deleted, will retry", currentDeployment);
+            LOG.info(
+                    "FlinkDeployment '{}' not deleted, will retry",
+                    currentDeployment.getMetadata().getName());
         } else {
-            LOG.info("FlinkDeployment '{}' deleted!", currentDeployment);
+            LOG.info("FlinkDeployment '{}' deleted!", currentDeployment.getMetadata().getName());
         }
 
         return UpdateControl.<FlinkBlueGreenDeployment>noUpdate().rescheduleAfter(RETRY_DELAY_MS);
