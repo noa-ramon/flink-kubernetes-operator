@@ -22,6 +22,8 @@ import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.autoscaler.config.AutoScalerOptions;
+import org.apache.flink.autoscaler.metrics.FlinkMetric;
+import org.apache.flink.autoscaler.topology.JobTopology;
 import org.apache.flink.autoscaler.utils.JobStatusUtils;
 import org.apache.flink.client.program.rest.RestClusterClient;
 import org.apache.flink.configuration.CheckpointingOptions;
@@ -58,7 +60,9 @@ import org.apache.flink.kubernetes.operator.utils.ExceptionUtils;
 import org.apache.flink.kubernetes.operator.utils.FlinkRuntimeConfigurationUtils;
 import org.apache.flink.kubernetes.operator.utils.FlinkUtils;
 import org.apache.flink.runtime.client.JobStatusMessage;
+import org.apache.flink.runtime.execution.ExecutionState;
 import org.apache.flink.runtime.highavailability.nonha.standalone.StandaloneClientHAServices;
+import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.jobmaster.JobResult;
 import org.apache.flink.runtime.messages.FlinkJobNotFoundException;
 import org.apache.flink.runtime.messages.FlinkJobTerminatedWithoutCancellationException;
@@ -72,7 +76,9 @@ import org.apache.flink.runtime.rest.messages.JobConfigHeaders;
 import org.apache.flink.runtime.rest.messages.JobConfigInfo;
 import org.apache.flink.runtime.rest.messages.JobExceptionsHeaders;
 import org.apache.flink.runtime.rest.messages.JobExceptionsInfoWithHistory;
+import org.apache.flink.runtime.rest.messages.JobIDPathParameter;
 import org.apache.flink.runtime.rest.messages.JobMessageParameters;
+import org.apache.flink.runtime.rest.messages.JobVertexIdPathParameter;
 import org.apache.flink.runtime.rest.messages.JobsOverviewHeaders;
 import org.apache.flink.runtime.rest.messages.TriggerId;
 import org.apache.flink.runtime.rest.messages.checkpoints.CheckpointConfigHeaders;
@@ -86,8 +92,14 @@ import org.apache.flink.runtime.rest.messages.checkpoints.CheckpointTriggerHeade
 import org.apache.flink.runtime.rest.messages.checkpoints.CheckpointTriggerRequestBody;
 import org.apache.flink.runtime.rest.messages.checkpoints.CheckpointingStatistics;
 import org.apache.flink.runtime.rest.messages.checkpoints.CheckpointingStatisticsHeaders;
+import org.apache.flink.runtime.rest.messages.job.JobDetailsHeaders;
+import org.apache.flink.runtime.rest.messages.job.JobDetailsInfo;
 import org.apache.flink.runtime.rest.messages.job.JobExceptionsMessageParameters;
 import org.apache.flink.runtime.rest.messages.job.JobManagerJobConfigurationHeaders;
+import org.apache.flink.runtime.rest.messages.job.metrics.AggregatedMetric;
+import org.apache.flink.runtime.rest.messages.job.metrics.AggregatedMetricsResponseBody;
+import org.apache.flink.runtime.rest.messages.job.metrics.AggregatedSubtaskMetricsHeaders;
+import org.apache.flink.runtime.rest.messages.job.metrics.AggregatedSubtaskMetricsParameters;
 import org.apache.flink.runtime.rest.messages.job.metrics.JobMetricsHeaders;
 import org.apache.flink.runtime.rest.messages.job.savepoints.SavepointDisposalRequest;
 import org.apache.flink.runtime.rest.messages.job.savepoints.SavepointDisposalTriggerHeaders;
@@ -146,13 +158,16 @@ import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -1224,6 +1239,177 @@ public abstract class AbstractFlinkService implements FlinkService {
         } catch (Exception e) {
             throw new RuntimeException("Failed to create empty jar", e);
         }
+    }
+
+    @Override
+    public SourceBacklogSnapshot getSourcePendingRecords(Configuration conf, String jobId)
+            throws Exception {
+        var flinkJobId = JobID.fromHexString(jobId);
+        try (var clusterClient = getClusterClient(conf)) {
+            var jobDetails = fetchJobDetails(clusterClient, flinkJobId);
+            var topology = JobTopology.fromJobDetails(jobDetails);
+
+            // The same response carries the identity of this observation: when the current
+            // incarnation of the job entered RUNNING, and when each vertex's current execution
+            // started. Both move forward on a restart, so a reading can never be mistaken for
+            // one from an execution that no longer exists.
+            long jobRunningTimestamp =
+                    jobDetails.getTimestamps().getOrDefault(JobStatus.RUNNING, 0L);
+            var vertexStartTimes = new HashMap<JobVertexID, Long>();
+            var vertexStates = new HashMap<JobVertexID, ExecutionState>();
+            jobDetails
+                    .getJobVertexInfos()
+                    .forEach(
+                            v -> {
+                                vertexStartTimes.put(v.getJobVertexID(), v.getStartTime());
+                                vertexStates.put(v.getJobVertexID(), v.getExecutionState());
+                            });
+
+            var sourceVertices = new ArrayList<JobVertexID>();
+            long sourcesEpoch = 0;
+            // A reading is only attributable while the job and all its unfinished sources are
+            // actually RUNNING: timestamps[RUNNING] is historical and survives into RESTARTING,
+            // and a regional restart can leave the job RUNNING while a source is not. Only
+            // sources matter here - a bounded source that already finished cannot hold a backlog,
+            // so it is excluded exactly as the autoscaler excludes finished vertices.
+            boolean observable = jobDetails.getJobStatus() == JobStatus.RUNNING;
+            for (var vertexId : topology.getVertexInfos().keySet()) {
+                if (!topology.isSource(vertexId)
+                        || topology.getFinishedVertices().contains(vertexId)) {
+                    continue;
+                }
+                sourceVertices.add(vertexId);
+                sourcesEpoch = Math.max(sourcesEpoch, vertexStartTimes.getOrDefault(vertexId, 0L));
+                observable &= vertexStates.get(vertexId) == ExecutionState.RUNNING;
+            }
+            if (!observable) {
+                LOG.debug("Job {} is not stably RUNNING, backlog reading discarded", jobId);
+                return SourceBacklogSnapshot.unobservable();
+            }
+
+            long pendingRecords = 0;
+            int runningSources = 0;
+            var reportingSources = new HashSet<JobVertexID>();
+
+            for (var vertexId : sourceVertices) {
+                runningSources++;
+                // The metric is exposed per operator, so its name carries the operator as a prefix
+                // (for example "Source__MySource.pendingRecords"). Ask the vertex which metrics it
+                // has before querying, exactly as the autoscaler does - a filter on the bare name
+                // matches nothing and would look identical to a drained backlog.
+                var names =
+                        FlinkMetric.PENDING_RECORDS.findAll(
+                                queryVertexMetrics(clusterClient, flinkJobId, vertexId, null)
+                                        .getMetrics()
+                                        .stream()
+                                        .map(AggregatedMetric::getId)
+                                        .collect(Collectors.toList()));
+
+                // A source that does not expose the metric contributes no backlog, matching how
+                // the autoscaler reads it: sources initialise it lazily on their first record, so
+                // an idle source never exposes it at all and has nothing pending by definition.
+                if (names.isEmpty()) {
+                    LOG.debug("Source {} does not expose {}", vertexId, "pendingRecords");
+                    continue;
+                }
+
+                for (var metric :
+                        queryVertexMetrics(clusterClient, flinkJobId, vertexId, names)
+                                .getMetrics()) {
+                    if (metric.getSum() != null) {
+                        pendingRecords += metric.getSum().longValue();
+                        reportingSources.add(vertexId);
+                        LOG.debug(
+                                "Source {} reports {}={}",
+                                vertexId,
+                                metric.getId(),
+                                metric.getSum().longValue());
+                    }
+                }
+            }
+
+            // The anchors were sampled before the metric reads. If a source restarted in
+            // between, a zero from its fresh gauge would be tagged with the old anchors and
+            // could complete an already-open confirmation window - the exact promotion this
+            // gate exists to prevent, and the only reading dangerous enough to re-verify.
+            // Re-read the job details and discard the observation unless the job is still
+            // RUNNING on the same anchors.
+            if (!reportingSources.isEmpty() && pendingRecords == 0) {
+                var recheck = fetchJobDetails(clusterClient, flinkJobId);
+                var recheckStartTimes = new HashMap<JobVertexID, Long>();
+                var recheckStates = new HashMap<JobVertexID, ExecutionState>();
+                recheck.getJobVertexInfos()
+                        .forEach(
+                                v -> {
+                                    recheckStartTimes.put(v.getJobVertexID(), v.getStartTime());
+                                    recheckStates.put(v.getJobVertexID(), v.getExecutionState());
+                                });
+                boolean unchanged =
+                        recheck.getJobStatus() == JobStatus.RUNNING
+                                && recheck.getTimestamps().getOrDefault(JobStatus.RUNNING, 0L)
+                                        == jobRunningTimestamp;
+                for (var vertexId : sourceVertices) {
+                    unchanged &=
+                            recheckStates.get(vertexId) == ExecutionState.RUNNING
+                                    && vertexStartTimes
+                                            .get(vertexId)
+                                            .equals(recheckStartTimes.get(vertexId));
+                }
+                if (!unchanged) {
+                    LOG.debug(
+                            "Job {} restarted while its backlog was read, zero reading discarded",
+                            jobId);
+                    return SourceBacklogSnapshot.unobservable();
+                }
+            }
+
+            // No source reporting at all is not a drained job, it is a job whose backlog could
+            // not be observed. That is what a query for the un-prefixed metric name used to look
+            // like, and it let a cutover through while the backlog was still growing.
+            var backlog =
+                    reportingSources.isEmpty()
+                            ? OptionalLong.empty()
+                            : OptionalLong.of(pendingRecords);
+            return new SourceBacklogSnapshot(
+                    backlog, runningSources, reportingSources, jobRunningTimestamp, sourcesEpoch);
+        }
+    }
+
+    private JobDetailsInfo fetchJobDetails(
+            RestClusterClient<String> clusterClient, JobID flinkJobId) throws Exception {
+        var detailsParameters = new JobMessageParameters();
+        detailsParameters.jobPathParameter.resolve(flinkJobId);
+        return clusterClient
+                .sendRequest(
+                        JobDetailsHeaders.getInstance(),
+                        detailsParameters,
+                        EmptyRequestBody.getInstance())
+                .get(operatorConfig.getFlinkClientTimeout().toSeconds(), TimeUnit.SECONDS);
+    }
+
+    private AggregatedMetricsResponseBody queryVertexMetrics(
+            RestClusterClient<String> clusterClient,
+            JobID jobId,
+            JobVertexID vertexId,
+            @Nullable List<String> metricNames)
+            throws Exception {
+        var parameters = new AggregatedSubtaskMetricsParameters();
+        var pathIt = parameters.getPathParameters().iterator();
+        ((JobIDPathParameter) pathIt.next()).resolve(jobId);
+        ((JobVertexIdPathParameter) pathIt.next()).resolve(vertexId);
+        if (metricNames != null) {
+            parameters
+                    .getQueryParameters()
+                    .iterator()
+                    .next()
+                    .resolveFromString(String.join(",", metricNames));
+        }
+        return clusterClient
+                .sendRequest(
+                        AggregatedSubtaskMetricsHeaders.getInstance(),
+                        parameters,
+                        EmptyRequestBody.getInstance())
+                .get(operatorConfig.getFlinkClientTimeout().toSeconds(), TimeUnit.SECONDS);
     }
 
     @Override

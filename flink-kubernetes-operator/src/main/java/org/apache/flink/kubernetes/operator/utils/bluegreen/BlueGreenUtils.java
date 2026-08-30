@@ -48,6 +48,9 @@ import java.util.Map;
 import java.util.Optional;
 
 import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions.BLUEGREEN_ABORT_GRACE_PERIOD;
+import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions.BLUEGREEN_CUTOVER_DRAIN_CONFIRMATION_WINDOW;
+import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions.BLUEGREEN_CUTOVER_DRAIN_TIMEOUT;
+import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions.BLUEGREEN_CUTOVER_WAIT_FOR_SOURCE_DRAIN;
 import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions.BLUEGREEN_DEPLOYMENT_DELETION_DELAY;
 import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions.BLUEGREEN_RECONCILIATION_RESCHEDULING_INTERVAL;
 import static org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGreenKubernetesService.getDependentObjectMeta;
@@ -171,6 +174,41 @@ public class BlueGreenUtils {
     public static long getDeploymentDeletionDelay(BlueGreenContext context) {
         return Math.max(
                 getConfigOption(context.getBgDeployment(), BLUEGREEN_DEPLOYMENT_DELETION_DELAY)
+                        .toMillis(),
+                0);
+    }
+
+    /**
+     * Whether the previous deployment must wait for the new deployment to drain its source backlog
+     * before being deleted.
+     *
+     * @param context the Blue/Green transition context
+     * @return true if the cutover should wait for the source backlog to drain
+     */
+    public static boolean isWaitForSourceDrainEnabled(BlueGreenContext context) {
+        return getConfigOption(context.getBgDeployment(), BLUEGREEN_CUTOVER_WAIT_FOR_SOURCE_DRAIN);
+    }
+
+    /**
+     * Gets the max time to wait for the new deployment to drain its source backlog.
+     *
+     * @param context the Blue/Green transition context
+     * @return drain timeout in milliseconds
+     */
+    public static long getCutoverDrainTimeout(BlueGreenContext context) {
+        return Math.max(
+                getConfigOption(context.getBgDeployment(), BLUEGREEN_CUTOVER_DRAIN_TIMEOUT).toMillis(), 0);
+    }
+
+    /**
+     * Gets how long the backlog must be read as continuously empty before a gated cutover.
+     *
+     * @param context the Blue/Green transition context
+     * @return the confirmation window in milliseconds
+     */
+    public static long getCutoverDrainConfirmationWindow(BlueGreenContext context) {
+        return Math.max(
+                getConfigOption(context.getBgDeployment(), BLUEGREEN_CUTOVER_DRAIN_CONFIRMATION_WINDOW)
                         .toMillis(),
                 0);
     }

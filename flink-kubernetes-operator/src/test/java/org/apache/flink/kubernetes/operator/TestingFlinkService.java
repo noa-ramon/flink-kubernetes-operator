@@ -55,6 +55,7 @@ import org.apache.flink.runtime.client.DuplicateJobSubmissionException;
 import org.apache.flink.runtime.client.JobStatusMessage;
 import org.apache.flink.runtime.clusterframework.ApplicationStatus;
 import org.apache.flink.runtime.execution.ExecutionState;
+import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.jobgraph.SavepointConfigOptions;
 import org.apache.flink.runtime.jobmanager.HighAvailabilityMode;
 import org.apache.flink.runtime.jobmaster.JobResult;
@@ -95,9 +96,12 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.Queue;
 import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -753,6 +757,64 @@ public class TestingFlinkService extends AbstractFlinkService {
     public Map<String, String> getMetrics(
             Configuration conf, String jobId, List<String> metricNames) {
         return metricsValues;
+    }
+
+    /**
+     * Pending records reported per {@code getSourcePendingRecords} call, consumed in order; a null
+     * entry means no source reported the metric.
+     */
+    @Setter private Queue<Optional<Long>> pendingRecordsQueue = new LinkedList<>();
+
+    @Setter private boolean pendingRecordsThrows = false;
+
+    /** A stable source identity, so consecutive readings anchor to the same reporting set. */
+    private static final JobVertexID TESTING_SOURCE_VERTEX = new JobVertexID();
+
+    @Setter private long jobRunningTimestamp = 1L;
+    @Setter private long sourcesEpoch = 1L;
+    @Setter private int runningSources = 1;
+    @Setter private Set<JobVertexID> reportingSources = Set.of(TESTING_SOURCE_VERTEX);
+
+    /** Simulates a job (or source) restart: the next reading belongs to a new incarnation. */
+    public void bumpJobIncarnation() {
+        jobRunningTimestamp++;
+        sourcesEpoch++;
+    }
+
+    @Override
+    public SourceBacklogSnapshot getSourcePendingRecords(Configuration conf, String jobId)
+            throws Exception {
+        if (pendingRecordsThrows) {
+            throw new Exception("Testing pending records failure");
+        }
+        // The last scripted value is sticky, so a single value means "always this backlog"
+        var next =
+                pendingRecordsQueue.size() > 1
+                        ? pendingRecordsQueue.poll()
+                        : pendingRecordsQueue.peek();
+        var value =
+                next == null
+                        ? OptionalLong.of(0L)
+                        : next.map(OptionalLong::of).orElseGet(OptionalLong::empty);
+        return new SourceBacklogSnapshot(
+                value,
+                runningSources,
+                value.isPresent() ? reportingSources : Set.of(),
+                jobRunningTimestamp,
+                sourcesEpoch);
+    }
+
+    /** Scripts "no source reports the metric" for the next check(s). */
+    public void setPendingRecordsUnreported() {
+        pendingRecordsQueue = new LinkedList<>(List.of(Optional.empty()));
+    }
+
+    public void setPendingRecords(Long... values) {
+        var q = new LinkedList<Optional<Long>>();
+        for (var v : values) {
+            q.add(Optional.of(v));
+        }
+        pendingRecordsQueue = q;
     }
 
     /**

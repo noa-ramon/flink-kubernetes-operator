@@ -33,6 +33,7 @@ import org.apache.flink.kubernetes.operator.observer.CheckpointFetchResult;
 import org.apache.flink.kubernetes.operator.observer.CheckpointStatsResult;
 import org.apache.flink.kubernetes.operator.observer.SavepointFetchResult;
 import org.apache.flink.runtime.client.JobStatusMessage;
+import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.jobmaster.JobResult;
 import org.apache.flink.runtime.rest.messages.JobExceptionsInfoWithHistory;
 
@@ -47,6 +48,8 @@ import javax.annotation.Nullable;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.Set;
 
 /** Service for submitting and interacting with Flink clusters and jobs. */
 public interface FlinkService {
@@ -123,6 +126,51 @@ public interface FlinkService {
 
     boolean scale(FlinkResourceContext<?> resourceContext, Configuration deployConfig)
             throws Exception;
+
+    /**
+     * Reads the job's source backlog: the {@code pendingRecords} metric summed over its running
+     * sources, together with the identity of the observation - which sources reported, and which
+     * incarnation of the job produced the reading.
+     *
+     * <p>A source that does not expose the metric contributes nothing, matching how the autoscaler
+     * reads it: sources initialise it lazily on their first record (FLIP-33 marks the metric
+     * optional), so an idle source never exposes it. Finished sources are skipped - a bounded
+     * source that completed cannot hold a backlog.
+     *
+     * <p>{@code pendingRecords} is empty only when no source reports the metric at all, which means
+     * the backlog could not be observed rather than that it is drained. The incarnation fields let
+     * callers detect that a reading belongs to a different execution of the job than the previous
+     * one: {@code jobRunningTimestamp} is the last time the job entered RUNNING and {@code
+     * sourcesEpoch} advances whenever a running source vertex was (re)started, both taken from the
+     * same job-details response as the backlog itself.
+     *
+     * @param conf the configuration to use for the REST client
+     * @param jobId the job to query
+     * @return the backlog observation
+     * @throws Exception in case of REST failures
+     */
+    SourceBacklogSnapshot getSourcePendingRecords(Configuration conf, String jobId)
+            throws Exception;
+
+    /** One observation of a job's source backlog, tied to the job incarnation that produced it. */
+    @AllArgsConstructor
+    @Getter
+    class SourceBacklogSnapshot {
+        private final OptionalLong pendingRecords;
+        private final int runningSources;
+        private final Set<JobVertexID> reportingSources;
+        private final long jobRunningTimestamp;
+        private final long sourcesEpoch;
+
+        /**
+         * A reading taken while the job was not stably RUNNING - during a restart, or when the
+         * anchors moved between the topology and metric reads. It carries no anchor, so the gate
+         * holds on it and restarts its confirmation window.
+         */
+        public static SourceBacklogSnapshot unobservable() {
+            return new SourceBacklogSnapshot(OptionalLong.empty(), 0, Set.of(), 0L, 0L);
+        }
+    }
 
     Map<String, String> getMetrics(Configuration conf, String jobId, List<String> metricNames)
             throws Exception;

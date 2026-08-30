@@ -826,4 +826,46 @@ public class KubernetesOperatorConfigOptions {
                     .defaultValue(Duration.ofMillis(0))
                     .withDescription(
                             "Configurable delay before deleting a deployment after being marked done.");
+
+    @Documentation.Section(SECTION_BLUEGREEN)
+    public static final ConfigOption<Boolean> BLUEGREEN_CUTOVER_WAIT_FOR_SOURCE_DRAIN =
+            operatorConfig("bluegreen.cutover.wait-for-source-drain")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "If enabled, the previous deployment is kept running until the new deployment has"
+                                    + " drained its source backlog (no pending records), instead of being deleted as"
+                                    + " soon as the new deployment is ready. A deployment restored from a savepoint is"
+                                    + " ready while it still replays the records produced during its own startup; for"
+                                    + " event time pipelines with a bounded allowed lateness, deleting the previous"
+                                    + " deployment during that catch-up leaves those records without a producer."
+                                    + " Requires sources exposing the pendingRecords metric (e.g. KafkaSource);"
+                                    + " a job where no source reports it never confirms as drained and the"
+                                    + " transition is aborted once bluegreen.cutover.drain-timeout expires.");
+
+    @Documentation.Section(SECTION_BLUEGREEN)
+    public static final ConfigOption<Duration> BLUEGREEN_CUTOVER_DRAIN_TIMEOUT =
+            operatorConfig("bluegreen.cutover.drain-timeout")
+                    .durationType()
+                    .defaultValue(Duration.ofHours(1))
+                    .withDescription(
+                            "The max time to wait for the new deployment to drain its source backlog when"
+                                    + " bluegreen.cutover.wait-for-source-drain is enabled, measured from the moment"
+                                    + " the new deployment became ready. If exceeded, the transition is aborted: the"
+                                    + " new deployment is suspended and the previous one remains active.");
+
+    @Documentation.Section(SECTION_BLUEGREEN)
+    public static final ConfigOption<Duration> BLUEGREEN_CUTOVER_DRAIN_CONFIRMATION_WINDOW =
+            operatorConfig("bluegreen.cutover.drain-confirmation-window")
+                    .durationType()
+                    .defaultValue(Duration.ofSeconds(30))
+                    .withDescription(
+                            "How long the new deployment's backlog must be read as continuously empty before the"
+                                    + " cutover proceeds when bluegreen.cutover.wait-for-source-drain is enabled. The"
+                                    + " window is measured from the first zero reading of the current incarnation of"
+                                    + " the job - never from wall time alone: a single reading is not evidence, since"
+                                    + " sources initialise pendingRecords lazily and a restart wipes the gauge. The"
+                                    + " window restarts whenever a non-zero backlog is read, no source reports the"
+                                    + " metric, the job or one of its source vertices restarts, or the set of"
+                                    + " reporting sources changes.");
 }

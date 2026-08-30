@@ -162,6 +162,18 @@ The abort mechanism ensures that a failed deployment does not disrupt production
 
 Recovery is then an ordinary next upgrade: inspect the suspended child for the root cause, correct the template, and apply it. The next spec change starts a fresh transition that redeploys the same color from the corrected spec.
 
+## Gating the Cutover on Source Drain
+
+By default the previous deployment is deleted as soon as the new one reports ready. Ready is not caught up: a deployment restored from the transition savepoint still replays the records produced during its own startup, and for event-time pipelines with bounded allowed lateness those records reach the sink late. Setting `kubernetes.operator.bluegreen.cutover.wait-for-source-drain: "true"` keeps the previous deployment running until the new deployment's source backlog (`pendingRecords`, summed over its running sources) has read as continuously empty for `kubernetes.operator.bluegreen.cutover.drain-confirmation-window` (default 30 s).
+
+The window is measured from the first zero reading of the current incarnation of the job - never from wall time alone: a single reading is not evidence, since sources initialize `pendingRecords` lazily and a restart wipes the gauge. The window restarts whenever a non-zero backlog is read, no source reports the metric, the metric cannot be read at all, the job is not observably running, the job or one of its source vertices restarts, or the set of reporting sources changes - continuity is a claim about observations, and any gap in them starts it over.
+
+`kubernetes.operator.bluegreen.cutover.drain-timeout` (default 1 h) bounds the wait, measured from the moment the new deployment became ready. On expiry the transition is aborted exactly like an expired grace period: the new deployment is suspended, the previous one keeps serving, and the resource is marked FAILING. The deadline is evaluated before the drain check, so an expired hold always ends in an abort.
+
+Every evaluation is logged (`Cutover gate for '<name>': pendingRecords=..., sources=..., zeroFor=..., heldFor=..., drainTimeoutIn=..., verdict=...`) and mirrored as `CutoverHeld` / `CutoverDrained` / `CutoverAborted` events on the blue/green resource. All three options live in the same `configuration` map as the rest of the blue/green settings, which is not part of the transition spec diff: they can be retuned while a transition is in flight and never trigger one.
+
+Note that a drained backlog proves offset parity with the topic head, not data completeness: if a backlog outlives the source topic's retention, records are removed by retention and the count falls identically to a drain. Sources also initialize `pendingRecords` lazily (FLIP-33 marks it optional), so a source that reports nothing contributes nothing; if no source reports at all, the backlog is treated as unknown and the gate holds. A job whose sources never report therefore cannot complete a gated transition - it fails closed at the drain timeout with the previous deployment kept.
+
 ## Configuration
 
 Blue/green behavior is configured on the resource itself, in the `configuration` map at the top level of the spec. These options are not read from the operator configuration, and the defaults apply when they are unset:
@@ -171,6 +183,9 @@ Blue/green behavior is configured on the resource itself, in the `configuration`
 | `kubernetes.operator.bluegreen.abort.grace-period`                 | 10 min  | Maximum time the new deployment is given to become stable before the transition is aborted |
 | `kubernetes.operator.bluegreen.reconciliation.reschedule-interval` | 15 s    | How often the controller re-checks progress during savepointing and transitions            |
 | `kubernetes.operator.bluegreen.deployment-deletion.delay`          | 0 ms    | Extra time the old deployment is kept running after the new one becomes stable             |
+| `kubernetes.operator.bluegreen.cutover.wait-for-source-drain`      | false   | Hold the cutover until the new deployment's source backlog is drained                      |
+| `kubernetes.operator.bluegreen.cutover.drain-confirmation-window`  | 30 s    | How long the backlog must read as continuously empty before the cutover proceeds           |
+| `kubernetes.operator.bluegreen.cutover.drain-timeout`              | 1 h     | Maximum time to wait for the drain before the transition is aborted                        |
 
 The same options are listed with their formal defaults under [Blue/Green Deployment Configuration]({{< ref "docs/deployment/configuration#bluegreen-configuration" >}}).
 
@@ -184,7 +199,7 @@ The operator exports blue/green metrics alongside its other resource metrics: ho
 
 ## Events
 
-The blue/green resource itself does not emit Kubernetes events, failures surface through its status and metrics instead. The two child deployments emit the standard operator events, submissions, upgrades, and errors, catalogued under [Events]({{< ref "docs/operations/events#operator-events" >}}).
+The blue/green resource itself emits Kubernetes events only for the cutover gate (`CutoverHeld`, `CutoverDrained`, `CutoverAborted`, when `kubernetes.operator.bluegreen.cutover.wait-for-source-drain` is enabled); other failures surface through its status and metrics instead. The two child deployments emit the standard operator events, submissions, upgrades, and errors, catalogued under [Events]({{< ref "docs/operations/events#operator-events" >}}).
 
 ## Limitations
 
