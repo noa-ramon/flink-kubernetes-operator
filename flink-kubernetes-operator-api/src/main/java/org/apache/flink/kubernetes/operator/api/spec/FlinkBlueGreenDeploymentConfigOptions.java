@@ -88,7 +88,7 @@ public class FlinkBlueGreenDeploymentConfigOptions {
     public static final ConfigOption<Duration> CUTOVER_DRAIN_TIMEOUT =
             operatorConfig("cutover.drain-timeout")
                     .durationType()
-                    .defaultValue(Duration.ofHours(1))
+                    .defaultValue(Duration.ofMinutes(30))
                     .withDescription(
                             "The max time to wait for the new deployment to drain its source backlog when"
                                     + " cutover.wait-for-source-drain is enabled, measured from the moment the gate"
