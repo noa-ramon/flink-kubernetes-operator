@@ -92,6 +92,37 @@ public class BlueGreenDeploymentService {
         this.clock = clock;
     }
 
+    /**
+     * Per-resource start of the current run of zero-backlog readings, keyed to the job incarnation
+     * that produced them. Operator-local by design: losing it on an operator restart only means the
+     * window is measured again - a longer hold, never a wrong cutover.
+     */
+    private final Map<String, DrainConfirmation> drainConfirmations = new ConcurrentHashMap<>();
+
+    private static String confirmationKey(BlueGreenContext context) {
+        return context.getBgDeployment().getMetadata().getNamespace()
+                + "/"
+                + context.getDeploymentName();
+    }
+
+    private static final class DrainConfirmation {
+        final long jobRunningTimestamp;
+        final long sourcesEpoch;
+        final Set<JobVertexID> reportingSources;
+        final long firstZeroTimestamp;
+
+        DrainConfirmation(
+                long jobRunningTimestamp,
+                long sourcesEpoch,
+                Set<JobVertexID> reportingSources,
+                long firstZeroTimestamp) {
+            this.jobRunningTimestamp = jobRunningTimestamp;
+            this.sourcesEpoch = sourcesEpoch;
+            this.reportingSources = reportingSources;
+            this.firstZeroTimestamp = firstZeroTimestamp;
+        }
+    }
+
     // ==================== Deployment Initiation Methods ====================
 
     /**
@@ -677,37 +708,6 @@ public class BlueGreenDeploymentService {
      * new deployment is suspended and the previous one stays active, consistent with how a
      * deployment that never becomes ready is handled.
      */
-    /**
-     * Per-resource start of the current run of zero-backlog readings, keyed to the job incarnation
-     * that produced them. Operator-local by design: losing it on an operator restart only means the
-     * window is measured again - a longer hold, never a wrong cutover.
-     */
-    private final Map<String, DrainConfirmation> drainConfirmations = new ConcurrentHashMap<>();
-
-    private static String confirmationKey(BlueGreenContext context) {
-        return context.getBgDeployment().getMetadata().getNamespace()
-                + "/"
-                + context.getDeploymentName();
-    }
-
-    private static final class DrainConfirmation {
-        final long jobRunningTimestamp;
-        final long sourcesEpoch;
-        final Set<JobVertexID> reportingSources;
-        final long firstZeroTimestamp;
-
-        DrainConfirmation(
-                long jobRunningTimestamp,
-                long sourcesEpoch,
-                Set<JobVertexID> reportingSources,
-                long firstZeroTimestamp) {
-            this.jobRunningTimestamp = jobRunningTimestamp;
-            this.sourcesEpoch = sourcesEpoch;
-            this.reportingSources = reportingSources;
-            this.firstZeroTimestamp = firstZeroTimestamp;
-        }
-    }
-
     private UpdateControl<FlinkBlueGreenDeployment> handleSourceDrain(
             BlueGreenContext context,
             FlinkDeployment currentDeployment,
