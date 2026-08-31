@@ -197,7 +197,9 @@ public class BlueGreenUtils {
      */
     public static long getCutoverDrainTimeout(BlueGreenContext context) {
         return Math.max(
-                getConfigOption(context.getBgDeployment(), BLUEGREEN_CUTOVER_DRAIN_TIMEOUT).toMillis(), 0);
+                getConfigOption(context.getBgDeployment(), BLUEGREEN_CUTOVER_DRAIN_TIMEOUT)
+                        .toMillis(),
+                0);
     }
 
     /**
@@ -208,7 +210,9 @@ public class BlueGreenUtils {
      */
     public static long getCutoverDrainConfirmationWindow(BlueGreenContext context) {
         return Math.max(
-                getConfigOption(context.getBgDeployment(), BLUEGREEN_CUTOVER_DRAIN_CONFIRMATION_WINDOW)
+                getConfigOption(
+                                context.getBgDeployment(),
+                                BLUEGREEN_CUTOVER_DRAIN_CONFIRMATION_WINDOW)
                         .toMillis(),
                 0);
     }

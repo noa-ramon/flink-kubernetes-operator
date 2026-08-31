@@ -17,6 +17,7 @@
 
 package org.apache.flink.kubernetes.operator.controller;
 
+import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.kubernetes.operator.api.FlinkBlueGreenDeployment;
 import org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState;
 import org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentStatus;
@@ -91,6 +92,11 @@ public class FlinkBlueGreenDeploymentController implements Reconciler<FlinkBlueG
         this.handlerRegistry = new BlueGreenStateHandlerRegistry();
         this.flinkConfigManager = flinkConfigManager;
         this.statusRecorder = statusRecorder;
+    }
+
+    @VisibleForTesting
+    public BlueGreenStateHandlerRegistry getHandlerRegistry() {
+        return handlerRegistry;
     }
 
     @Override

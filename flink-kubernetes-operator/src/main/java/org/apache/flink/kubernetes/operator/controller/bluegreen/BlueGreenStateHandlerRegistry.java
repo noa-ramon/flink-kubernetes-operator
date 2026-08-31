@@ -17,6 +17,7 @@
 
 package org.apache.flink.kubernetes.operator.controller.bluegreen;
 
+import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState;
 import org.apache.flink.kubernetes.operator.controller.bluegreen.handlers.ActiveStateHandler;
 import org.apache.flink.kubernetes.operator.controller.bluegreen.handlers.BlueGreenStateHandler;
@@ -39,9 +40,12 @@ public class BlueGreenStateHandlerRegistry {
 
     private final Map<FlinkBlueGreenDeploymentState, BlueGreenStateHandler> handlers;
 
+    private final BlueGreenDeploymentService deploymentService;
+
     public BlueGreenStateHandlerRegistry() {
         // Create consolidated service
-        BlueGreenDeploymentService deploymentService = new BlueGreenDeploymentService();
+        this.deploymentService = new BlueGreenDeploymentService();
+        BlueGreenDeploymentService deploymentService = this.deploymentService;
 
         // Create handlers
         this.handlers =
@@ -71,5 +75,10 @@ public class BlueGreenStateHandlerRegistry {
      */
     public BlueGreenStateHandler getHandler(FlinkBlueGreenDeploymentState state) {
         return handlers.get(state);
+    }
+
+    @VisibleForTesting
+    public BlueGreenDeploymentService getDeploymentService() {
+        return deploymentService;
     }
 }
