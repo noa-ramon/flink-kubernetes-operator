@@ -847,7 +847,7 @@ public class KubernetesOperatorConfigOptions {
     public static final ConfigOption<Duration> BLUEGREEN_CUTOVER_DRAIN_TIMEOUT =
             operatorConfig("bluegreen.cutover.drain-timeout")
                     .durationType()
-                    .defaultValue(Duration.ofHours(1))
+                    .defaultValue(Duration.ofMinutes(30))
                     .withDescription(
                             "The max time to wait for the new deployment to drain its source backlog when"
                                     + " bluegreen.cutover.wait-for-source-drain is enabled, measured from the moment"
