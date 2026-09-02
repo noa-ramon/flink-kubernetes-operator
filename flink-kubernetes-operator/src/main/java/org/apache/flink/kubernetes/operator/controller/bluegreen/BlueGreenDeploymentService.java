@@ -970,10 +970,10 @@ public class BlueGreenDeploymentService {
     }
 
     /**
-     * The moment the drain gate's wait expires, measured from readiness: the gate is only
-     * entered once the deployment deletion delay has elapsed, so the delay is part of the
-     * budget. Built in exactly one place - one deadline serving two call sites is how a
-     * deadline ends up governing the wrong phase.
+     * The moment the drain gate's wait expires, measured from readiness: the gate is only entered
+     * once the deployment deletion delay has elapsed, so the delay is part of the budget. Built in
+     * exactly one place - one deadline serving two call sites is how a deadline ends up governing
+     * the wrong phase.
      */
     private long drainDeadline(BlueGreenContext context, long deploymentReadyTimestamp) {
         return deploymentReadyTimestamp

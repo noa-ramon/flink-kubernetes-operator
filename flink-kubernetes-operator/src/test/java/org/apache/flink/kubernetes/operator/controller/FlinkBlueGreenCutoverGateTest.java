@@ -42,9 +42,9 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
 /**
- * Tests for the blue/green cutover drain gate: the observation-anchored confirmation window,
- * the fail-closed drain deadline, and the readiness latch that keeps a mid-hold dip from
- * being judged by the expired become-ready deadline.
+ * Tests for the blue/green cutover drain gate: the observation-anchored confirmation window, the
+ * fail-closed drain deadline, and the readiness latch that keeps a mid-hold dip from being judged
+ * by the expired become-ready deadline.
  */
 public class FlinkBlueGreenCutoverGateTest extends FlinkBlueGreenDeploymentControllerTestBase {
 
@@ -952,10 +952,10 @@ public class FlinkBlueGreenCutoverGateTest extends FlinkBlueGreenDeploymentContr
     /**
      * The abort timestamp bounds becoming ready and is armed once, at transition start. A
      * deployment holding for the drain gate is necessarily past that deadline, so when its
-     * readiness dips for seconds - an in-place autoscaler rescale flips STABLE to DEPLOYED -
-     * the dip must not be judged by it: observed live, a 998 ms dip aborted a healthy
-     * transition with 24 minutes of drain budget unused. Past first readiness the hold
-     * continues, and the recovered deployment drains and cuts over normally.
+     * readiness dips for seconds - an in-place autoscaler rescale flips STABLE to DEPLOYED - the
+     * dip must not be judged by it: observed live, a 998 ms dip aborted a healthy transition with
+     * 24 minutes of drain budget unused. Past first readiness the hold continues, and the recovered
+     * deployment drains and cuts over normally.
      */
     @ParameterizedTest
     @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
@@ -1028,9 +1028,9 @@ public class FlinkBlueGreenCutoverGateTest extends FlinkBlueGreenDeploymentContr
     }
 
     /**
-     * The latch must not convert the abort into a wedge: a deployment that goes unready and
-     * stays unready is no longer a transient dip, and it is bounded by the deadline that
-     * governs the hold - the drain deadline - rather than held forever.
+     * The latch must not convert the abort into a wedge: a deployment that goes unready and stays
+     * unready is no longer a transient dip, and it is bounded by the deadline that governs the hold
+     * - the drain deadline - rather than held forever.
      */
     @ParameterizedTest
     @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
@@ -1083,14 +1083,12 @@ public class FlinkBlueGreenCutoverGateTest extends FlinkBlueGreenDeploymentContr
                 rs.reconciledStatus.getBlueGreenState(),
                 "a deployment unready past the drain deadline must abort, not wedge");
         assertEquals(
-                2,
-                getFlinkDeployments().size(),
-                "the failed deployment is kept for inspection");
+                2, getFlinkDeployments().size(), "the failed deployment is kept for inspection");
     }
 
     /**
-     * With the drain gate off the latch must not engage: a deployment that goes unready
-     * after readiness, past the grace period, aborts exactly as stock does today.
+     * With the drain gate off the latch must not engage: a deployment that goes unready after
+     * readiness, past the grace period, aborts exactly as stock does today.
      */
     @ParameterizedTest
     @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")

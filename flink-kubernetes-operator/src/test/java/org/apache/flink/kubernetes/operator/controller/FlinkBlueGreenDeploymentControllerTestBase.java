@@ -72,8 +72,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Shared harness for the {@link FlinkBlueGreenDeploymentController} test classes: the mock
- * Kubernetes client, the testing controller and service, and the helpers that drive a
- * blue/green transition end to end.
+ * Kubernetes client, the testing controller and service, and the helpers that drive a blue/green
+ * transition end to end.
  */
 @EnableKubernetesMockClient(crud = true)
 public abstract class FlinkBlueGreenDeploymentControllerTestBase {
@@ -107,9 +107,10 @@ public abstract class FlinkBlueGreenDeploymentControllerTestBase {
     }
 
     @NotNull
-    protected TestingFlinkBlueGreenDeploymentController.BlueGreenReconciliationResult handleSavepoint(
-            TestingFlinkBlueGreenDeploymentController.BlueGreenReconciliationResult rs)
-            throws Exception {
+    protected TestingFlinkBlueGreenDeploymentController.BlueGreenReconciliationResult
+            handleSavepoint(
+                    TestingFlinkBlueGreenDeploymentController.BlueGreenReconciliationResult rs)
+                    throws Exception {
 
         var triggers = flinkService.getSavepointTriggers();
         triggers.clear();
@@ -284,7 +285,8 @@ public abstract class FlinkBlueGreenDeploymentControllerTestBase {
         kubernetesClient.resource(blueGreenDeployment).createOrReplace();
     }
 
-    protected void simulateSubmitAndSuccessfulJobStart(FlinkDeployment deployment) throws Exception {
+    protected void simulateSubmitAndSuccessfulJobStart(FlinkDeployment deployment)
+            throws Exception {
         // TODO: is this correct? Doing this to give the TestingFlinkService awareness of the job
         JobSpec jobSpec = deployment.getSpec().getJob();
         Configuration conf = new Configuration();
@@ -452,5 +454,4 @@ public abstract class FlinkBlueGreenDeploymentControllerTestBase {
 
         return new FlinkBlueGreenDeploymentSpec(configuration, null, flinkDeploymentTemplateSpec);
     }
-
 }

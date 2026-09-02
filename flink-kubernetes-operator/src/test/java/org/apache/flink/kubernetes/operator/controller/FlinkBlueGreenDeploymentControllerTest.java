@@ -1641,5 +1641,4 @@ public class FlinkBlueGreenDeploymentControllerTest
                 rs.reconciledStatus.getBlueGreenState(),
                 "Green must become the active state after Blue is deleted");
     }
-
 }
