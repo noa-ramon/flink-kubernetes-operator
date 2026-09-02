@@ -2626,4 +2626,186 @@ public class FlinkBlueGreenDeploymentControllerTest {
                 FlinkBlueGreenDeploymentState.ACTIVE_GREEN,
                 rs.reconciledStatus.getBlueGreenState());
     }
+
+    /**
+     * The abort timestamp bounds becoming ready and is armed once, at transition start. A
+     * deployment holding for the drain gate is necessarily past that deadline, so when its
+     * readiness dips for seconds - an in-place autoscaler rescale flips STABLE to DEPLOYED - the
+     * dip must not be judged by it: observed live, a 998 ms dip aborted a healthy transition with
+     * 24 minutes of drain budget unused. Past first readiness the hold continues, and the recovered
+     * deployment drains and cuts over normally.
+     */
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyReadinessDipDuringTheHoldDoesNotAbort(FlinkVersion flinkVersion)
+            throws Exception {
+        var blueGreenDeployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        flinkVersion,
+                        null,
+                        UpgradeMode.SAVEPOINT);
+
+        Map<String, String> configuration = blueGreenDeployment.getSpec().getConfiguration();
+        configuration.put(CUTOVER_WAIT_FOR_SOURCE_DRAIN.key(), "true");
+        configuration.put(CUTOVER_DRAIN_TIMEOUT.key(), "600000");
+        configuration.put(CUTOVER_DRAIN_CONFIRMATION_WINDOW.key(), "300");
+        configuration.put(DEPLOYMENT_DELETION_DELAY.key(), "0");
+        configuration.put(RECONCILIATION_RESCHEDULING_INTERVAL.key(), "100");
+        // a short grace period, so the phase-one deadline is long expired during the hold
+        configuration.put(ABORT_GRACE_PERIOD.key(), "1000");
+
+        var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+        var clock = useSteppingClock();
+
+        // a backlog that does not drain, so the gate keeps holding
+        flinkService.setPendingRecords(500L);
+
+        simulateChangeInSpec(rs.deployment, UUID.randomUUID().toString(), 0, null);
+        rs = handleSavepoint(rs);
+        rs = reconcile(rs.deployment);
+        var green = getFlinkDeployments().get(1);
+        simulateSuccessfulJobStart(green);
+        // marks ready, then the gate holds on the backlog
+        rs = reconcile(rs.deployment);
+        rs = reconcile(rs.deployment);
+        assertEquals(2, getFlinkDeployments().size());
+
+        // deep into the hold, far past the phase-one grace period...
+        clock.advance(5000);
+        // ...readiness dips: an in-place rescale takes the job out of RUNNING for seconds
+        green = getFlinkDeployments().get(1);
+        green.getStatus().getJobStatus().setState(JobStatus.RECONCILING);
+        kubernetesClient.resource(green).update();
+        rs = reconcile(rs.deployment);
+
+        assertEquals(
+                FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN,
+                rs.reconciledStatus.getBlueGreenState(),
+                "a readiness dip during the hold must not be judged by the expired"
+                        + " become-ready deadline");
+        assertEquals(
+                2,
+                getFlinkDeployments().size(),
+                "both deployments must survive a transient dip during the hold");
+
+        // the dip ends, the backlog drains, and the held transition completes normally
+        green = getFlinkDeployments().get(1);
+        green.getStatus().getJobStatus().setState(JobStatus.RUNNING);
+        kubernetesClient.resource(green).update();
+        flinkService.setPendingRecords(0L);
+        rs = reconcile(rs.deployment);
+        clock.advance(350);
+        rs = reconcile(rs.deployment);
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_GREEN,
+                rs.reconciledStatus.getBlueGreenState(),
+                "the recovered deployment must drain and cut over normally");
+    }
+
+    /**
+     * The latch must not convert the abort into a wedge: a deployment that goes unready and stays
+     * unready is no longer a transient dip, and it is bounded by the deadline that governs the hold
+     * - the drain deadline - rather than held forever.
+     */
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyUnreadyPastTheDrainDeadlineAborts(FlinkVersion flinkVersion)
+            throws Exception {
+        var blueGreenDeployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        flinkVersion,
+                        null,
+                        UpgradeMode.SAVEPOINT);
+
+        Map<String, String> configuration = blueGreenDeployment.getSpec().getConfiguration();
+        configuration.put(CUTOVER_WAIT_FOR_SOURCE_DRAIN.key(), "true");
+        configuration.put(CUTOVER_DRAIN_TIMEOUT.key(), "2000");
+        configuration.put(CUTOVER_DRAIN_CONFIRMATION_WINDOW.key(), "300");
+        configuration.put(DEPLOYMENT_DELETION_DELAY.key(), "0");
+        configuration.put(RECONCILIATION_RESCHEDULING_INTERVAL.key(), "100");
+        configuration.put(ABORT_GRACE_PERIOD.key(), "1000");
+
+        var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+        var clock = useSteppingClock();
+
+        flinkService.setPendingRecords(500L);
+
+        simulateChangeInSpec(rs.deployment, UUID.randomUUID().toString(), 0, null);
+        rs = handleSavepoint(rs);
+        rs = reconcile(rs.deployment);
+        var green = getFlinkDeployments().get(1);
+        simulateSuccessfulJobStart(green);
+        rs = reconcile(rs.deployment);
+        rs = reconcile(rs.deployment);
+
+        // the deployment goes unready and never recovers
+        green = getFlinkDeployments().get(1);
+        green.getStatus().getJobStatus().setState(JobStatus.RECONCILING);
+        kubernetesClient.resource(green).update();
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN,
+                rs.reconciledStatus.getBlueGreenState(),
+                "inside the drain budget an unready hold is still a hold");
+
+        // past the drain deadline the hold is no longer transient
+        clock.advance(3000);
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_BLUE,
+                rs.reconciledStatus.getBlueGreenState(),
+                "a deployment unready past the drain deadline must abort, not wedge");
+        assertEquals(
+                2, getFlinkDeployments().size(), "the failed deployment is kept for inspection");
+    }
+
+    /**
+     * With the drain gate off the latch must not engage: a deployment that goes unready after
+     * readiness, past the grace period, aborts exactly as stock does today.
+     */
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyDipAfterReadinessStillAbortsWithTheGateOff(FlinkVersion flinkVersion)
+            throws Exception {
+        var blueGreenDeployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        flinkVersion,
+                        null,
+                        UpgradeMode.SAVEPOINT);
+
+        Map<String, String> configuration = blueGreenDeployment.getSpec().getConfiguration();
+        // gate off; a deletion delay long enough that the dip happens mid-wait
+        configuration.put(DEPLOYMENT_DELETION_DELAY.key(), "60000");
+        configuration.put(RECONCILIATION_RESCHEDULING_INTERVAL.key(), "100");
+        configuration.put(ABORT_GRACE_PERIOD.key(), "1000");
+
+        var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+        var clock = useSteppingClock();
+
+        simulateChangeInSpec(rs.deployment, UUID.randomUUID().toString(), 0, null);
+        rs = handleSavepoint(rs);
+        rs = reconcile(rs.deployment);
+        var green = getFlinkDeployments().get(1);
+        simulateSuccessfulJobStart(green);
+        // marks ready, arms the deletion delay
+        rs = reconcile(rs.deployment);
+
+        clock.advance(5000);
+        green = getFlinkDeployments().get(1);
+        green.getStatus().getJobStatus().setState(JobStatus.RECONCILING);
+        kubernetesClient.resource(green).update();
+        rs = reconcile(rs.deployment);
+
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_BLUE,
+                rs.reconciledStatus.getBlueGreenState(),
+                "with the gate off, behaviour is unchanged: an expired grace period aborts");
+    }
 }
