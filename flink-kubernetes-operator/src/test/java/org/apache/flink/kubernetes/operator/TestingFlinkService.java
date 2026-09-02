@@ -801,7 +801,8 @@ public class TestingFlinkService extends AbstractFlinkService {
                 runningSources,
                 value.isPresent() ? reportingSources : Set.of(),
                 jobRunningTimestamp,
-                sourcesEpoch);
+                sourcesEpoch,
+                Map.of());
     }
 
     /** Scripts "no source reports the metric" for the next check(s). */

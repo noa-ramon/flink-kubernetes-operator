@@ -1114,15 +1114,18 @@ public abstract class AbstractFlinkService implements FlinkService {
                     jobDetails.getTimestamps().getOrDefault(JobStatus.RUNNING, 0L);
             var vertexStartTimes = new HashMap<JobVertexID, Long>();
             var vertexStates = new HashMap<JobVertexID, ExecutionState>();
+            var vertexNames = new HashMap<JobVertexID, String>();
             jobDetails
                     .getJobVertexInfos()
                     .forEach(
                             v -> {
                                 vertexStartTimes.put(v.getJobVertexID(), v.getStartTime());
                                 vertexStates.put(v.getJobVertexID(), v.getExecutionState());
+                                vertexNames.put(v.getJobVertexID(), shortVertexName(v.getName()));
                             });
 
             var sourceVertices = new ArrayList<JobVertexID>();
+            var sourceNames = new HashMap<JobVertexID, String>();
             long sourcesEpoch = 0;
             // A reading is only attributable while the job and all its unfinished sources are
             // actually RUNNING: timestamps[RUNNING] is historical and survives into RESTARTING,
@@ -1136,6 +1139,7 @@ public abstract class AbstractFlinkService implements FlinkService {
                     continue;
                 }
                 sourceVertices.add(vertexId);
+                sourceNames.put(vertexId, vertexNames.getOrDefault(vertexId, vertexId.toString()));
                 sourcesEpoch = Math.max(sourcesEpoch, vertexStartTimes.getOrDefault(vertexId, 0L));
                 observable &= vertexStates.get(vertexId) == ExecutionState.RUNNING;
             }
@@ -1228,8 +1232,27 @@ public abstract class AbstractFlinkService implements FlinkService {
                             ? OptionalLong.empty()
                             : OptionalLong.of(pendingRecords);
             return new SourceBacklogSnapshot(
-                    backlog, runningSources, reportingSources, jobRunningTimestamp, sourcesEpoch);
+                    backlog,
+                    runningSources,
+                    reportingSources,
+                    jobRunningTimestamp,
+                    sourcesEpoch,
+                    sourceNames);
         }
+    }
+
+    /**
+     * A vertex name is the whole chained operator name ("Source: packets -> Filter -> ..."); for
+     * the cutover audit log only its head identifies the source, bounded so one exotic name cannot
+     * flood the line.
+     */
+    private static String shortVertexName(String name) {
+        if (name == null) {
+            return "?";
+        }
+        int arrow = name.indexOf(" -> ");
+        String head = arrow > 0 ? name.substring(0, arrow) : name;
+        return head.length() > 60 ? head.substring(0, 57) + "..." : head;
     }
 
     private JobDetailsInfo fetchJobDetails(

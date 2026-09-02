@@ -161,6 +161,9 @@ public interface FlinkService {
         private final Set<JobVertexID> reportingSources;
         private final long jobRunningTimestamp;
         private final long sourcesEpoch;
+        // Human-readable names of the running source vertices, for the audit log only -
+        // identity comparisons stay on the vertex ids above.
+        private final Map<JobVertexID, String> sourceNames;
 
         /**
          * A reading taken while the job was not stably RUNNING - during a restart, or when the
@@ -168,7 +171,7 @@ public interface FlinkService {
          * holds on it and restarts its confirmation window.
          */
         public static SourceBacklogSnapshot unobservable() {
-            return new SourceBacklogSnapshot(OptionalLong.empty(), 0, Set.of(), 0L, 0L);
+            return new SourceBacklogSnapshot(OptionalLong.empty(), 0, Set.of(), 0L, 0L, Map.of());
         }
     }
 

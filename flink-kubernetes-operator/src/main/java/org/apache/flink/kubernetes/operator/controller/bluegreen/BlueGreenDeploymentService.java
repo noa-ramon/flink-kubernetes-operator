@@ -56,6 +56,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
 import static org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGreenKubernetesService.deleteFlinkDeployment;
 import static org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGreenKubernetesService.deployCluster;
@@ -798,24 +799,39 @@ public class BlueGreenDeploymentService {
         // One audit record per evaluation, so the drain can be reconstructed from the operator log
         // alone: a gate that decides when the previous deployment stops producing has to leave
         // evidence of every observation it acted on, not only of the decisions that changed state.
+        // Verdict first, then the observation it was taken on, then the three clocks.
+        String backlogSummary;
+        FlinkService.SourceBacklogSnapshot observed = backlog;
+        if (observed == null) {
+            backlogSummary = "unknown (the metric could not be read)";
+        } else {
+            String reportingNames =
+                    observed.getReportingSources().stream()
+                            .map(id -> observed.getSourceNames().getOrDefault(id, id.toString()))
+                            .sorted()
+                            .collect(Collectors.joining(", "));
+            backlogSummary =
+                    (observed.getPendingRecords().isPresent()
+                                    ? observed.getPendingRecords().getAsLong() + " records"
+                                    : "unreported")
+                            + ", from "
+                            + observed.getReportingSources().size()
+                            + " of "
+                            + observed.getRunningSources()
+                            + " sources"
+                            + (reportingNames.isEmpty() ? "" : " (" + reportingNames + ")");
+        }
         LOG.info(
-                "Cutover gate for '{}': pendingRecords={}, sources={}, zeroFor={}/{} s,"
-                        + " heldFor={} s, drainTimeoutIn={} s, verdict={}{}",
+                "Cutover gate for '{}': verdict={}{} | backlog={} | window {}/{}s | held {}s"
+                        + " | deadline in {}s",
                 nextDeploymentName,
-                backlog == null
-                        ? "unknown"
-                        : backlog.getPendingRecords().isPresent()
-                                ? String.valueOf(backlog.getPendingRecords().getAsLong())
-                                : "unreported",
-                backlog == null
-                        ? "?/?"
-                        : backlog.getReportingSources().size() + "/" + backlog.getRunningSources(),
+                pastDeadline ? "ABORT" : (notDrainedReason == null ? "CUTOVER" : "HOLD"),
+                notDrainedReason == null ? "" : " (" + notDrainedReason + ")",
+                backlogSummary,
                 zeroConfirmedFor / 1000,
                 confirmationWindow / 1000,
                 heldFor / 1000,
-                Math.max(0, drainDeadline - clock.millis()) / 1000,
-                pastDeadline ? "ABORT" : (notDrainedReason == null ? "CUTOVER" : "HOLD"),
-                notDrainedReason == null ? "" : " (" + notDrainedReason + ")");
+                Math.max(0, drainDeadline - clock.millis()) / 1000);
 
         // The deadline is evaluated before the backlog, so an expired hold can only ever end in an
         // abort. Checking it second made the timeout advisory: a zero arriving at expiry won it,
