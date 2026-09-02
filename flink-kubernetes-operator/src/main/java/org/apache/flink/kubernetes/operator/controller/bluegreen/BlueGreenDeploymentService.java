@@ -792,13 +792,7 @@ public class BlueGreenDeploymentService {
         }
 
         long heldFor = clock.millis() - deploymentReadyTimestamp;
-        // The gate is only entered after the deployment deletion delay has elapsed, so the
-        // deadline is anchored there rather than at readiness: anchored at readiness, a delay
-        // longer than the drain timeout would expire the deadline before the first backlog
-        // reading is ever taken and abort a healthy transition on entry.
-        long gateOpenTimestamp =
-                deploymentReadyTimestamp + BlueGreenUtils.getDeploymentDeletionDelay(context);
-        long drainDeadline = gateOpenTimestamp + getCutoverDrainTimeout(context);
+        long drainDeadline = drainDeadline(context, deploymentReadyTimestamp);
         boolean pastDeadline = drainDeadline < clock.millis();
 
         // One audit record per evaluation, so the drain can be reconstructed from the operator log
@@ -950,11 +944,41 @@ public class BlueGreenDeploymentService {
             throw new IllegalStateException("Unexpected abortTimestamp == 0");
         }
 
+        // The abort timestamp bounds phase one of a transition - becoming ready - and is
+        // armed once, at transition start. A deployment that has already been ready and is
+        // now holding for the drain gate is past that phase: its readiness can dip for
+        // seconds during an in-place rescale, and judging that dip by the long-expired
+        // phase-one deadline aborts a healthy transition with the whole drain budget
+        // unused. deploymentReadyTimestamp is the latch - stamped only when readiness was
+        // first observed, cleared when the transition ends - so past it, unreadiness is
+        // judged by the deadline that governs this phase: still bounded, a permanently
+        // broken deployment aborts at the drain deadline instead of wedging.
+        long deploymentReadyTimestamp =
+                instantStrToMillis(context.getDeploymentStatus().getDeploymentReadyTimestamp());
+        if (deploymentReadyTimestamp != 0 && isWaitForSourceDrainEnabled(context)) {
+            if (drainDeadline(context, deploymentReadyTimestamp) < clock.millis()) {
+                return abortDeployment(context, nextDeployment, nextState, deploymentName);
+            }
+            return retryDeployment(context, deploymentName);
+        }
+
         if (abortTimestamp < clock.millis()) {
             return abortDeployment(context, nextDeployment, nextState, deploymentName);
         } else {
             return retryDeployment(context, deploymentName);
         }
+    }
+
+    /**
+     * The moment the drain gate's wait expires, measured from readiness: the gate is only
+     * entered once the deployment deletion delay has elapsed, so the delay is part of the
+     * budget. Built in exactly one place - one deadline serving two call sites is how a
+     * deadline ends up governing the wrong phase.
+     */
+    private long drainDeadline(BlueGreenContext context, long deploymentReadyTimestamp) {
+        return deploymentReadyTimestamp
+                + BlueGreenUtils.getDeploymentDeletionDelay(context)
+                + getCutoverDrainTimeout(context);
     }
 
     private UpdateControl<FlinkBlueGreenDeployment> retryDeployment(
