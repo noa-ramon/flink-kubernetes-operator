@@ -1130,4 +1130,79 @@ public class FlinkBlueGreenCutoverGateTest extends FlinkBlueGreenDeploymentContr
                 rs.reconciledStatus.getBlueGreenState(),
                 "with the gate off, behaviour is unchanged: an expired grace period aborts");
     }
+
+    /**
+     * A re-spec while the gate is holding replaces the candidate mid-flight. The readiness stamp
+     * guards on zero and is never re-taken, so without a reset the rebuilt candidate inherits the
+     * previous candidate's clock and its drain deadline expires early - observed live as an abort
+     * with 898k records still pending and 17 minutes of honest budget remaining. The re-spec must
+     * reset the transition markers so the rebuilt candidate re-arms a full drain budget of its own.
+     */
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyReSpecDuringTheHoldGrantsAFreshDrainBudget(FlinkVersion flinkVersion)
+            throws Exception {
+        var blueGreenDeployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        flinkVersion,
+                        null,
+                        UpgradeMode.SAVEPOINT);
+
+        Map<String, String> configuration = blueGreenDeployment.getSpec().getConfiguration();
+        configuration.put(BLUEGREEN_CUTOVER_WAIT_FOR_SOURCE_DRAIN.key(), "true");
+        configuration.put(BLUEGREEN_CUTOVER_DRAIN_TIMEOUT.key(), "2000");
+        configuration.put(BLUEGREEN_CUTOVER_DRAIN_CONFIRMATION_WINDOW.key(), "300");
+        configuration.put(BLUEGREEN_DEPLOYMENT_DELETION_DELAY.key(), "0");
+        configuration.put(BLUEGREEN_RECONCILIATION_RESCHEDULING_INTERVAL.key(), "100");
+        configuration.put(BLUEGREEN_ABORT_GRACE_PERIOD.key(), "60000");
+
+        var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+        var clock = useSteppingClock();
+
+        // transition 1: a backlog holds the gate while most of the drain budget burns down
+        flinkService.setPendingRecords(500L);
+        simulateChangeInSpec(rs.deployment, UUID.randomUUID().toString(), 0, null);
+        rs = handleSavepoint(rs);
+        rs = reconcile(rs.deployment);
+        simulateSuccessfulJobStart(getFlinkDeployments().get(1));
+        rs = reconcile(rs.deployment);
+        rs = reconcile(rs.deployment);
+        assertEquals(2, getFlinkDeployments().size());
+        clock.advance(1500);
+
+        // a second spec change lands mid-hold: the candidate is rebuilt with the new spec
+        simulateChangeInSpec(rs.deployment, UUID.randomUUID().toString(), 0, null);
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                millisToInstantStr(0),
+                rs.reconciledStatus.getDeploymentReadyTimestamp(),
+                "a re-spec replaces the candidate, so the previous candidate's readiness"
+                        + " clock must not survive it");
+
+        // the rebuilt candidate boots and holds; on the inherited clock its deadline would
+        // already be expired - on its own it has the full budget
+        simulateSuccessfulJobStart(getFlinkDeployments().get(1));
+        rs = reconcile(rs.deployment);
+        clock.advance(700);
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN,
+                rs.reconciledStatus.getBlueGreenState(),
+                "the rebuilt candidate must be judged by its own drain budget, not the"
+                        + " previous candidate's leftovers");
+        assertEquals(2, getFlinkDeployments().size());
+
+        // and with a full budget of its own, it drains and cuts over normally
+        flinkService.setPendingRecords(0L);
+        rs = reconcile(rs.deployment);
+        clock.advance(350);
+        rs = reconcile(rs.deployment);
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_GREEN,
+                rs.reconciledStatus.getBlueGreenState(),
+                "the re-specced transition completes on its own clock");
+    }
 }
