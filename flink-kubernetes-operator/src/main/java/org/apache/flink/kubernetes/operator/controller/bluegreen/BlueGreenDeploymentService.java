@@ -605,6 +605,17 @@ public class BlueGreenDeploymentService {
 
             if (diffType != BlueGreenDiffType.IGNORE) {
                 setLastReconciledSpec(context);
+                // A re-spec mid-transition replaces the candidate, so the markers scoping the
+                // current attempt describe a deployment that is about to stop existing. Left in
+                // place, the rebuilt candidate is judged against the previous candidate's clocks:
+                // the readiness stamp guards on zero and is never re-taken, so the new
+                // deployment's drain deadline starts at the OLD readiness and it gets whatever
+                // budget its predecessor left behind (observed live: aborted with 898k records
+                // pending and 17 minutes of honest budget remaining). Reset exactly as every
+                // other attempt boundary does; initiateDeployment re-arms the abort grace period
+                // for the new attempt right after.
+                resetTransitionMarkers(context.getDeploymentStatus());
+                drainConfirmations.remove(confirmationKey(context));
                 var oppositeDeploymentType =
                         context.getOppositeDeploymentType(currentBlueGreenDeploymentType);
                 LOG.info(
