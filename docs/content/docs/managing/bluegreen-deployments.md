@@ -148,6 +148,8 @@ For reaching the Flink Web UI and REST API there are two ingress layers, both cr
 
 Traffic switching happens through the active ingress: when a transition completes, its backend is updated from the old to the new REST service, for example from `basic-bg-example-blue-rest` to `basic-bg-example-green-rest`, and the ingress controller shifts connections to the new target service without downtime. When ingress management is disabled, no ingress is created or updated and traffic management is expected to be handled externally.
 
+Each child is created with the labels of the blue/green resource, plus `flink/blue-green-deployment-type: BLUE|GREEN` identifying its color. The marker is applied last, so it wins over a label of the same key on the parent. Inheritance matters when the operator is scoped with `kubernetes.operator.label.selector`: a child carrying only the marker does not match a selector written against the parent's labels, so the FlinkDeployment controller never reconciles the child the blue/green controller just created, and the transition holds until it aborts at the grace period. `flink.apache.org/canary` is the one label deliberately not inherited, since it makes the FlinkDeployment controller skip the resource entirely.
+
 ## Health Monitoring and Recovery
 
 A new deployment is considered successful when its job reports `RUNNING` and the child resource reaches the `STABLE` lifecycle state ([Status and Lifecycle]({{< ref "docs/custom-resource/status-and-lifecycle" >}})). During a transition the controller re-checks these conditions on the rescheduling interval, and the new deployment has the length of the abort grace period to meet them.
