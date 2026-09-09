@@ -24,7 +24,9 @@ import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentSpec;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkDeploymentSpec;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkDeploymentTemplateSpec;
+import org.apache.flink.kubernetes.operator.api.bluegreen.BlueGreenDeploymentType;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkVersion;
+import org.apache.flink.kubernetes.operator.health.CanaryResourceManager;
 import org.apache.flink.kubernetes.operator.api.spec.IngressSpec;
 import org.apache.flink.kubernetes.operator.api.spec.JobState;
 import org.apache.flink.kubernetes.operator.api.spec.UpgradeMode;
@@ -79,6 +81,38 @@ public class FlinkBlueGreenDeploymentControllerTest
                         initialSavepointPath,
                         UpgradeMode.STATELESS);
         executeBasicDeployment(flinkVersion, blueGreenDeployment, true, initialSavepointPath);
+    }
+
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyChildInheritsParentLabelsWithoutTheCanaryMarker(FlinkVersion flinkVersion)
+            throws Exception {
+        var blueGreenDeployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME, TEST_NAMESPACE, flinkVersion, null, UpgradeMode.STATELESS);
+        blueGreenDeployment
+                .getMetadata()
+                .setLabels(
+                        Map.of(
+                                "cost-type",
+                                "cogs",
+                                "team",
+                                "sre",
+                                CanaryResourceManager.CANARY_LABEL,
+                                "true"));
+
+        executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+
+        var childLabels = getFlinkDeployments().get(0).getMetadata().getLabels();
+        assertEquals("cogs", childLabels.get("cost-type"));
+        assertEquals("sre", childLabels.get("team"));
+        assertEquals(
+                BlueGreenDeploymentType.BLUE.toString(),
+                childLabels.get(BlueGreenDeploymentType.LABEL_KEY));
+        assertFalse(
+                childLabels.containsKey(CanaryResourceManager.CANARY_LABEL),
+                "The canary marker must not be inherited: it makes the FlinkDeployment controller"
+                        + " skip the child entirely");
     }
 
     @ParameterizedTest
