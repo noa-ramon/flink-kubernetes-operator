@@ -425,11 +425,12 @@ public class BlueGreenUtils {
      * Builds the child FlinkDeployment's labels: the parent's labels, plus the blue/green type
      * marker.
      *
-     * <p>The parent's labels are inherited because an operator installation may be scoped by
-     * {@code kubernetes.operator.label.selector}: children carrying only the marker fail their own
+     * <p>The parent's labels are inherited because an operator installation may be scoped by {@code
+     * kubernetes.operator.label.selector}: children carrying only the marker fail their own
      * operator's selector, so the blue/green controller creates a FlinkDeployment that the
      * FlinkDeployment controller never reconciles, and the transition hangs until it aborts.
-     * Inheriting also keeps identity/cost-attribution labels consistent between parent and children.
+     * Inheriting also keeps identity/cost-attribution labels consistent between parent and
+     * children.
      *
      * <p>{@code flink.apache.org/canary} is deliberately not inherited: it makes the
      * FlinkDeployment controller skip reconciliation entirely, which would reproduce that same

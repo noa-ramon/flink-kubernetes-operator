@@ -139,7 +139,11 @@ public class FlinkBlueGreenDeploymentControllerTest {
             throws Exception {
         var blueGreenDeployment =
                 buildSessionCluster(
-                        TEST_DEPLOYMENT_NAME, TEST_NAMESPACE, flinkVersion, null, UpgradeMode.STATELESS);
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        flinkVersion,
+                        null,
+                        UpgradeMode.STATELESS);
         blueGreenDeployment
                 .getMetadata()
                 .setLabels(
