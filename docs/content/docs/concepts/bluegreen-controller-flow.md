@@ -126,6 +126,24 @@ backlog is treated as unknown and the gate holds. A job whose sources never repo
 cannot complete a gated transition - it fails closed at the drain timeout with the previous
 deployment kept.
 
+### Child Deployment Labels
+
+Each child FlinkDeployment is created with its parent's labels, plus
+`flink/blue-green-deployment-type: BLUE|GREEN` identifying the colour. The marker is applied last,
+so it wins over a label of the same key on the parent.
+
+Inheritance matters when the operator is scoped with
+`kubernetes.operator.label.selector`: a child carrying only the marker does not match a selector
+written against the parent's labels, so the FlinkDeployment controller never reconciles the child
+that the blue/green controller just created. That failure is silent - the child has no status, no
+events and no pods, while the blue/green controller reports `not ready yet` until the transition
+aborts at `abort.grace-period`. Inheritance also keeps identity and cost-attribution labels
+consistent between a parent and whichever colour is currently live.
+
+`flink.apache.org/canary` is the one label deliberately not inherited: it makes the FlinkDeployment
+controller skip the resource entirely, which would reproduce that same silent hang for a parent
+that is a legitimate canary resource.
+
 ## Blue/Green State Machine
 
 The FlinkBlueGreenDeploymentController uses a state machine to orchestrate zero-downtime deployments. The state machine continuously works to reconcile the deployment to one of two terminal/stable states: **ACTIVE_BLUE** or **ACTIVE_GREEN**. These represent the steady states where a single environment is running and serving traffic.
