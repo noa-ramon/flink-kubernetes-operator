@@ -35,6 +35,7 @@ import org.apache.flink.kubernetes.operator.api.utils.SpecUtils;
 import org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions;
 import org.apache.flink.kubernetes.operator.controller.FlinkResourceContext;
 import org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGreenContext;
+import org.apache.flink.kubernetes.operator.health.CanaryResourceManager;
 import org.apache.flink.kubernetes.operator.observer.SavepointFetchResult;
 import org.apache.flink.kubernetes.operator.reconciler.diff.FlinkBlueGreenDeploymentSpecDiff;
 import org.apache.flink.util.Preconditions;
@@ -44,6 +45,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 
@@ -414,9 +416,32 @@ public class BlueGreenUtils {
         // Deployment metadata
         ObjectMeta flinkDeploymentMeta = getDependentObjectMeta(context.getBgDeployment());
         flinkDeploymentMeta.setName(childDeploymentName);
-        flinkDeploymentMeta.setLabels(
-                Map.of(BlueGreenDeploymentType.LABEL_KEY, blueGreenDeploymentType.toString()));
+        flinkDeploymentMeta.setLabels(childLabels(context, blueGreenDeploymentType));
         flinkDeployment.setMetadata(flinkDeploymentMeta);
         return flinkDeployment;
+    }
+
+    /**
+     * Builds the child FlinkDeployment's labels: the parent's labels, plus the blue/green type
+     * marker.
+     *
+     * <p>The parent's labels are inherited because an operator installation may be scoped by
+     * {@code kubernetes.operator.label.selector}: children carrying only the marker fail their own
+     * operator's selector, so the blue/green controller creates a FlinkDeployment that the
+     * FlinkDeployment controller never reconciles, and the transition hangs until it aborts.
+     * Inheriting also keeps identity/cost-attribution labels consistent between parent and children.
+     *
+     * <p>{@code flink.apache.org/canary} is deliberately not inherited: it makes the
+     * FlinkDeployment controller skip reconciliation entirely, which would reproduce that same
+     * silent hang from a parent that is a legitimate canary.
+     */
+    private static Map<String, String> childLabels(
+            BlueGreenContext context, BlueGreenDeploymentType blueGreenDeploymentType) {
+        Map<String, String> labels = new HashMap<>();
+        Optional.ofNullable(context.getBgDeployment().getMetadata().getLabels())
+                .ifPresent(labels::putAll);
+        labels.remove(CanaryResourceManager.CANARY_LABEL);
+        labels.put(BlueGreenDeploymentType.LABEL_KEY, blueGreenDeploymentType.toString());
+        return labels;
     }
 }
