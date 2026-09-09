@@ -25,13 +25,12 @@ import org.apache.flink.kubernetes.operator.TestUtils;
 import org.apache.flink.kubernetes.operator.TestingFlinkService;
 import org.apache.flink.kubernetes.operator.api.FlinkBlueGreenDeployment;
 import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
+import org.apache.flink.kubernetes.operator.api.bluegreen.BlueGreenDeploymentType;
 import org.apache.flink.kubernetes.operator.api.spec.ConfigObjectNode;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentSpec;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkDeploymentSpec;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkDeploymentTemplateSpec;
-import org.apache.flink.kubernetes.operator.api.bluegreen.BlueGreenDeploymentType;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkVersion;
-import org.apache.flink.kubernetes.operator.health.CanaryResourceManager;
 import org.apache.flink.kubernetes.operator.api.spec.IngressSpec;
 import org.apache.flink.kubernetes.operator.api.spec.JobManagerSpec;
 import org.apache.flink.kubernetes.operator.api.spec.JobSpec;
@@ -43,6 +42,7 @@ import org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentS
 import org.apache.flink.kubernetes.operator.api.status.ReconciliationState;
 import org.apache.flink.kubernetes.operator.api.utils.SpecUtils;
 import org.apache.flink.kubernetes.operator.config.FlinkConfigManager;
+import org.apache.flink.kubernetes.operator.health.CanaryResourceManager;
 import org.apache.flink.kubernetes.operator.utils.IngressUtils;
 import org.apache.flink.runtime.jobgraph.SavepointConfigOptions;
 
